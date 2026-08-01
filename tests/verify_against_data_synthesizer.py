@@ -12,6 +12,9 @@ and answer_key.json) and programmatically asserts:
    positives).
 3. Each flagged ledger's reported discrepancy amount matches the answer
    key's recorded delta (within 1 paise, for float/Decimal rounding).
+4. Every flagged result carries all four HARD RULE #6 structured
+   explanation fields (finding, potential_implication,
+   recommended_manual_check, why_correction_matters), each non-empty.
 
 This is a standalone script, not a unittest module, because it needs a
 samples-root directory argument and is meant to be run deliberately against
@@ -35,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from checks.opening_balance_vs_prior_year_closing import load_trial_balance_csv, run_check
 
 AMOUNT_EPSILON = Decimal("0.01")
+FLAGGED_DETAIL_FIELDS = ("finding", "potential_implication", "recommended_manual_check", "why_correction_matters")
 
 
 def verify_company(company_dir: Path) -> list:
@@ -91,6 +95,17 @@ def verify_company(company_dir: Path) -> list:
                 f"AMOUNT MISMATCH on '{ledger}': check reported {actual_delta}, "
                 f"answer key says {expected_delta}"
             )
+
+    for r in results:
+        if r.status != "flagged":
+            continue
+        for field_name in FLAGGED_DETAIL_FIELDS:
+            value = getattr(r, field_name)
+            if not value or not value.strip():
+                failures.append(
+                    f"HARD RULE #6 VIOLATION on '{r.source_reference.ledger}': "
+                    f"{field_name} is missing or empty"
+                )
 
     return failures
 

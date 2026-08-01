@@ -39,6 +39,24 @@ for a CA/CPA audit tool.
    against that answer key programmatically — not just eyeballed.
 5. Flag any assumption about Indian tax/audit law you're not fully certain
    about, rather than silently assuming.
+6. Every "flagged" result must include a structured explanation, not just a
+   one-line description. Flagged results carry these additional fields:
+   - `finding`: the specific discrepancy in plain language, with exact
+     numbers (what doesn't match, by how much).
+   - `potential_implication`: what this kind of mismatch commonly indicates
+     in a real audit context (e.g. unrecorded disposal, unauthorized
+     adjustment, data migration error, a legitimate but undocumented
+     write-off) — a professional CA's read on what this class of error could
+     mean, not just "numbers don't match."
+   - `recommended_manual_check`: the specific, concrete action a CA should
+     take to resolve this (what document/record to check against, who to
+     ask).
+   - `why_correction_matters`: the downstream consequence of leaving this
+     unresolved (e.g. undermines reliability of all subsequent account
+     movement, may indicate a control weakness).
+   `"pass"` and `"insufficient_data"` results only need the existing plain
+   `description` field — this richer structure exists specifically because
+   `"flagged"` is what a CA actually has to act on.
 
 ## WORKING RULE
 At the end of any task or meaningful chunk of work, always run git add, git
@@ -56,6 +74,12 @@ commit with a clear descriptive message, and git push.
   RULE #1, there is no probabilistic judgment for these) — reserved for
   future checks that may involve genuine uncertainty (e.g. fuzzy name
   matching, OCR-derived data).
+- `"insufficient_data"` is reserved for genuine cases where the check itself
+  cannot produce a result at all — e.g. a corrupted, missing, or unparseable
+  input file. It is NOT used for a per-item finding like a missing ledger:
+  that's a real audit-relevant finding a CA needs to act on, so it must be
+  `"flagged"` (with the HARD RULE #6 structured explanation), not
+  `"insufficient_data"`.
 - [Fill in more conventions as they're established.]
 
 ## Structure (update as it grows)
@@ -71,4 +95,7 @@ commit with a clear descriptive message, and git push.
 - `opening_balance_vs_prior_year_closing.py` — **FINAL.** Validated against 5
   real data-synthesizer sample companies (2 clean, 3 with 2/3/4 injected
   errors); every injected error flagged, no false positives, amounts match
-  the answer key to the paisa. See the module's own docstring for details.
+  the answer key to the paisa, and every flagged result carries all four
+  HARD RULE #6 structured explanation fields, non-empty. Missing-ledger
+  cases are `"flagged"` (not `"insufficient_data"`) — see the module's own
+  docstring for details.

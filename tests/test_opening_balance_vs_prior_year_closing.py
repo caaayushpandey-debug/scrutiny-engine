@@ -19,11 +19,31 @@ from checks.opening_balance_vs_prior_year_closing import (
     LedgerBalance,
     load_trial_balance_csv,
     run_check,
+    run_check_from_files,
 )
+
+FLAGGED_DETAIL_FIELDS = ("finding", "potential_implication", "recommended_manual_check", "why_correction_matters")
 
 
 def lb(name, group, debit="0.00", credit="0.00"):
     return LedgerBalance(name=name, group=group, debit=Decimal(debit), credit=Decimal(credit))
+
+
+def assert_has_flagged_detail(test_case, result):
+    """HARD RULE #6: every flagged result must carry all four structured
+    explanation fields, each non-empty.
+    """
+    test_case.assertEqual(result.status, "flagged")
+    for field_name in FLAGGED_DETAIL_FIELDS:
+        value = getattr(result, field_name)
+        test_case.assertIsInstance(value, str, f"{field_name} should be a populated string")
+        test_case.assertTrue(value.strip(), f"{field_name} should not be empty")
+
+
+def assert_no_flagged_detail(test_case, result):
+    """pass/insufficient_data results must NOT carry the flagged-only fields."""
+    for field_name in FLAGGED_DETAIL_FIELDS:
+        test_case.assertIsNone(getattr(result, field_name), f"{field_name} should be None for status={result.status}")
 
 
 class RunCheckTests(unittest.TestCase):
@@ -38,6 +58,7 @@ class RunCheckTests(unittest.TestCase):
         self.assertEqual(result.confidence_score, 1.0)
         self.assertEqual(result.amount, Decimal("63168.89"))
         self.assertEqual(result.source_reference.ledger, "Cash in Hand")
+        assert_no_flagged_detail(self, result)
 
     def test_diff_within_tolerance_passes(self):
         prior = [lb("Cash in Hand", "Cash-in-Hand", debit="1000.00")]
@@ -55,7 +76,7 @@ class RunCheckTests(unittest.TestCase):
 
         self.assertEqual(result.status, "pass")
 
-    def test_diff_beyond_tolerance_flagged(self):
+    def test_diff_beyond_tolerance_flagged_with_full_detail(self):
         # Mirrors data-synthesizer's actual injected-error shape: Office
         # Building 2096831.52 -> 2004157.38 (delta -92674.14).
         prior = [lb("Office Building", "Fixed Assets", debit="2096831.52")]
@@ -66,11 +87,14 @@ class RunCheckTests(unittest.TestCase):
         self.assertEqual(result.status, "flagged")
         self.assertEqual(result.confidence_score, 1.0)
         self.assertEqual(result.amount, Decimal("92674.14"))
-        self.assertIn("Office Building", result.description)
+        self.assertIn("Office Building", result.finding)
+        self.assertIn("Office Building", result.description)  # description mirrors finding
+        assert_has_flagged_detail(self, result)
 
     def test_credit_side_mismatch_flagged(self):
-        # Partner's Capital Account is credit-normal; net balance = credit - debit...
-        # net_balance is debit - credit, so a credit-only ledger has a negative net balance.
+        # Partner's Capital Account is credit-normal; net_balance = debit - credit
+        # is negative for a pure-credit ledger, which is fine -- the diff is
+        # what's compared, not the sign.
         prior = [lb("Partner's Capital Account", "Capital Account", credit="4468672.27")]
         current = [lb("Partner's Capital Account", "Capital Account", credit="4542230.60")]
 
@@ -78,26 +102,40 @@ class RunCheckTests(unittest.TestCase):
 
         self.assertEqual(result.status, "flagged")
         self.assertEqual(result.amount, Decimal("73558.33"))
+        assert_has_flagged_detail(self, result)
 
-    def test_ledger_missing_from_current_year_is_insufficient_data(self):
+    def test_ledger_missing_from_current_year_is_flagged(self):
         prior = [lb("Sundry Debtors - Acme Pvt Ltd", "Sundry Debtors", debit="500000.00")]
         current = []
 
         [result] = run_check(prior, current)
 
-        self.assertEqual(result.status, "insufficient_data")
+        self.assertEqual(result.status, "flagged")
         self.assertEqual(result.amount, Decimal("500000.00"))
-        self.assertIn("missing entirely", result.description)
+        self.assertIn("does not appear anywhere", result.finding)
+        assert_has_flagged_detail(self, result)
 
-    def test_ledger_missing_from_prior_year_is_insufficient_data(self):
+    def test_ledger_missing_from_prior_year_is_flagged(self):
         prior = []
         current = [lb("Sundry Debtors - New Client Pvt Ltd", "Sundry Debtors", debit="200000.00")]
 
         [result] = run_check(prior, current)
 
-        self.assertEqual(result.status, "insufficient_data")
+        self.assertEqual(result.status, "flagged")
         self.assertEqual(result.amount, Decimal("200000.00"))
-        self.assertIn("not present in the prior year", result.description)
+        self.assertIn("was not present in the prior year", result.finding)
+        assert_has_flagged_detail(self, result)
+
+    def test_run_check_never_returns_insufficient_data(self):
+        # By design (see module docstring "status semantics") -- missing
+        # ledgers are "flagged", not "insufficient_data". insufficient_data
+        # only comes from run_check_from_files failing to load a file.
+        prior = [lb("Only In Prior", "Sundry Debtors", debit="1.00")]
+        current = [lb("Only In Current", "Sundry Debtors", debit="1.00")]
+
+        results = run_check(prior, current)
+
+        self.assertTrue(all(r.status != "insufficient_data" for r in results))
 
     def test_mixed_batch_produces_expected_status_counts(self):
         prior = [
@@ -115,9 +153,12 @@ class RunCheckTests(unittest.TestCase):
         statuses = [r.status for r in results]
 
         self.assertEqual(statuses.count("pass"), 1)
-        self.assertEqual(statuses.count("flagged"), 1)
-        self.assertEqual(statuses.count("insufficient_data"), 2)
+        self.assertEqual(statuses.count("flagged"), 3)  # amount mismatch + 2 missing-ledger cases
+        self.assertEqual(statuses.count("insufficient_data"), 0)
         self.assertEqual(len(results), 4)
+        for r in results:
+            if r.status == "flagged":
+                assert_has_flagged_detail(self, r)
 
     def test_results_sorted_by_ledger_name(self):
         prior = [
@@ -132,6 +173,65 @@ class RunCheckTests(unittest.TestCase):
         results = run_check(prior, current)
 
         self.assertEqual([r.source_reference.ledger for r in results], ["Alpha Ledger", "Zebra Ledger"])
+
+
+class RunCheckFromFilesTests(unittest.TestCase):
+    def _write_csv(self, tmpdir, filename, content):
+        path = Path(tmpdir) / filename
+        path.write_text(content)
+        return str(path)
+
+    def test_missing_prior_year_file_is_insufficient_data(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            current_path = self._write_csv(
+                tmpdir, "current.csv",
+                "Ledger Name,Group,Debit,Credit\nCash in Hand,Cash-in-Hand,100.00,0.00\n",
+            )
+            results = run_check_from_files(str(Path(tmpdir) / "does_not_exist.csv"), current_path)
+
+        [result] = results
+        self.assertEqual(result.status, "insufficient_data")
+        self.assertIn("prior year closing", result.description)
+        assert_no_flagged_detail(self, result)
+
+    def test_missing_current_year_file_is_insufficient_data(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prior_path = self._write_csv(
+                tmpdir, "prior.csv",
+                "Ledger Name,Group,Debit,Credit\nCash in Hand,Cash-in-Hand,100.00,0.00\n",
+            )
+            results = run_check_from_files(prior_path, str(Path(tmpdir) / "does_not_exist.csv"))
+
+        [result] = results
+        self.assertEqual(result.status, "insufficient_data")
+        self.assertIn("current year opening", result.description)
+
+    def test_corrupted_prior_year_file_is_insufficient_data(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prior_path = self._write_csv(tmpdir, "prior.csv", "not,a,valid,trial,balance,csv\n1,2,3,4,5,6\n")
+            current_path = self._write_csv(
+                tmpdir, "current.csv",
+                "Ledger Name,Group,Debit,Credit\nCash in Hand,Cash-in-Hand,100.00,0.00\n",
+            )
+            results = run_check_from_files(prior_path, current_path)
+
+        [result] = results
+        self.assertEqual(result.status, "insufficient_data")
+
+    def test_well_formed_files_run_normally(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prior_path = self._write_csv(
+                tmpdir, "prior.csv",
+                "Ledger Name,Group,Debit,Credit\nCash in Hand,Cash-in-Hand,100.00,0.00\n",
+            )
+            current_path = self._write_csv(
+                tmpdir, "current.csv",
+                "Ledger Name,Group,Debit,Credit\nCash in Hand,Cash-in-Hand,100.00,0.00\n",
+            )
+            results = run_check_from_files(prior_path, current_path)
+
+        [result] = results
+        self.assertEqual(result.status, "pass")
 
 
 class LoadTrialBalanceCsvTests(unittest.TestCase):
