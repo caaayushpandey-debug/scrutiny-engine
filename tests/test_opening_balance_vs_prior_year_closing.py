@@ -8,6 +8,9 @@ tests/verify_against_data_synthesizer.py, which runs the check against real
 data-synthesizer output and diffs the result against each company's
 answer_key.json programmatically. It has been run and passed; see that
 script's docstring and the check module's own docstring for the result.
+
+CSV-loading tests live in tests/test_schemas_trial_balance.py -- that's now
+a schema-layer concern (schemas/trial_balance.py), not a check-layer one.
 """
 import tempfile
 import unittest
@@ -16,17 +19,20 @@ from pathlib import Path
 
 from checks.opening_balance_vs_prior_year_closing import (
     CHECK_ID,
-    LedgerBalance,
-    load_trial_balance_csv,
     run_check,
     run_check_from_files,
 )
+from schemas.trial_balance import LedgerBalance, TrialBalance
 
 FLAGGED_DETAIL_FIELDS = ("finding", "potential_implication", "recommended_manual_check", "why_correction_matters")
 
 
 def lb(name, group, debit="0.00", credit="0.00"):
     return LedgerBalance(name=name, group=group, debit=Decimal(debit), credit=Decimal(credit))
+
+
+def tb(*ledgers):
+    return TrialBalance(ledgers=list(ledgers))
 
 
 def assert_has_flagged_detail(test_case, result):
@@ -48,8 +54,8 @@ def assert_no_flagged_detail(test_case, result):
 
 class RunCheckTests(unittest.TestCase):
     def test_matching_balance_passes(self):
-        prior = [lb("Cash in Hand", "Cash-in-Hand", debit="63168.89")]
-        current = [lb("Cash in Hand", "Cash-in-Hand", debit="63168.89")]
+        prior = tb(lb("Cash in Hand", "Cash-in-Hand", debit="63168.89"))
+        current = tb(lb("Cash in Hand", "Cash-in-Hand", debit="63168.89"))
 
         [result] = run_check(prior, current)
 
@@ -61,16 +67,16 @@ class RunCheckTests(unittest.TestCase):
         assert_no_flagged_detail(self, result)
 
     def test_diff_within_tolerance_passes(self):
-        prior = [lb("Cash in Hand", "Cash-in-Hand", debit="1000.00")]
-        current = [lb("Cash in Hand", "Cash-in-Hand", debit="1000.50")]
+        prior = tb(lb("Cash in Hand", "Cash-in-Hand", debit="1000.00"))
+        current = tb(lb("Cash in Hand", "Cash-in-Hand", debit="1000.50"))
 
         [result] = run_check(prior, current, tolerance=Decimal("1.00"))
 
         self.assertEqual(result.status, "pass")
 
     def test_diff_exactly_at_tolerance_boundary_passes(self):
-        prior = [lb("Cash in Hand", "Cash-in-Hand", debit="1000.00")]
-        current = [lb("Cash in Hand", "Cash-in-Hand", debit="1001.00")]
+        prior = tb(lb("Cash in Hand", "Cash-in-Hand", debit="1000.00"))
+        current = tb(lb("Cash in Hand", "Cash-in-Hand", debit="1001.00"))
 
         [result] = run_check(prior, current, tolerance=Decimal("1.00"))
 
@@ -79,8 +85,8 @@ class RunCheckTests(unittest.TestCase):
     def test_diff_beyond_tolerance_flagged_with_full_detail(self):
         # Mirrors data-synthesizer's actual injected-error shape: Office
         # Building 2096831.52 -> 2004157.38 (delta -92674.14).
-        prior = [lb("Office Building", "Fixed Assets", debit="2096831.52")]
-        current = [lb("Office Building", "Fixed Assets", debit="2004157.38")]
+        prior = tb(lb("Office Building", "Fixed Assets", debit="2096831.52"))
+        current = tb(lb("Office Building", "Fixed Assets", debit="2004157.38"))
 
         [result] = run_check(prior, current)
 
@@ -95,8 +101,8 @@ class RunCheckTests(unittest.TestCase):
         # Partner's Capital Account is credit-normal; net_balance = debit - credit
         # is negative for a pure-credit ledger, which is fine -- the diff is
         # what's compared, not the sign.
-        prior = [lb("Partner's Capital Account", "Capital Account", credit="4468672.27")]
-        current = [lb("Partner's Capital Account", "Capital Account", credit="4542230.60")]
+        prior = tb(lb("Partner's Capital Account", "Capital Account", credit="4468672.27"))
+        current = tb(lb("Partner's Capital Account", "Capital Account", credit="4542230.60"))
 
         [result] = run_check(prior, current)
 
@@ -105,8 +111,8 @@ class RunCheckTests(unittest.TestCase):
         assert_has_flagged_detail(self, result)
 
     def test_ledger_missing_from_current_year_is_flagged(self):
-        prior = [lb("Sundry Debtors - Acme Pvt Ltd", "Sundry Debtors", debit="500000.00")]
-        current = []
+        prior = tb(lb("Sundry Debtors - Acme Pvt Ltd", "Sundry Debtors", debit="500000.00"))
+        current = tb()
 
         [result] = run_check(prior, current)
 
@@ -116,8 +122,8 @@ class RunCheckTests(unittest.TestCase):
         assert_has_flagged_detail(self, result)
 
     def test_ledger_missing_from_prior_year_is_flagged(self):
-        prior = []
-        current = [lb("Sundry Debtors - New Client Pvt Ltd", "Sundry Debtors", debit="200000.00")]
+        prior = tb()
+        current = tb(lb("Sundry Debtors - New Client Pvt Ltd", "Sundry Debtors", debit="200000.00"))
 
         [result] = run_check(prior, current)
 
@@ -130,24 +136,24 @@ class RunCheckTests(unittest.TestCase):
         # By design (see module docstring "status semantics") -- missing
         # ledgers are "flagged", not "insufficient_data". insufficient_data
         # only comes from run_check_from_files failing to load a file.
-        prior = [lb("Only In Prior", "Sundry Debtors", debit="1.00")]
-        current = [lb("Only In Current", "Sundry Debtors", debit="1.00")]
+        prior = tb(lb("Only In Prior", "Sundry Debtors", debit="1.00"))
+        current = tb(lb("Only In Current", "Sundry Debtors", debit="1.00"))
 
         results = run_check(prior, current)
 
         self.assertTrue(all(r.status != "insufficient_data" for r in results))
 
     def test_mixed_batch_produces_expected_status_counts(self):
-        prior = [
+        prior = tb(
             lb("Cash in Hand", "Cash-in-Hand", debit="63168.89"),
             lb("Office Building", "Fixed Assets", debit="2096831.52"),
             lb("Sundry Debtors - Only In Prior", "Sundry Debtors", debit="10000.00"),
-        ]
-        current = [
+        )
+        current = tb(
             lb("Cash in Hand", "Cash-in-Hand", debit="63168.89"),
             lb("Office Building", "Fixed Assets", debit="2004157.38"),
             lb("Sundry Debtors - Only In Current", "Sundry Debtors", debit="20000.00"),
-        ]
+        )
 
         results = run_check(prior, current)
         statuses = [r.status for r in results]
@@ -161,14 +167,14 @@ class RunCheckTests(unittest.TestCase):
                 assert_has_flagged_detail(self, r)
 
     def test_results_sorted_by_ledger_name(self):
-        prior = [
+        prior = tb(
             lb("Zebra Ledger", "Sundry Creditors", credit="1000.00"),
             lb("Alpha Ledger", "Sundry Debtors", debit="1000.00"),
-        ]
-        current = [
+        )
+        current = tb(
             lb("Zebra Ledger", "Sundry Creditors", credit="1000.00"),
             lb("Alpha Ledger", "Sundry Debtors", debit="1000.00"),
-        ]
+        )
 
         results = run_check(prior, current)
 
@@ -232,53 +238,6 @@ class RunCheckFromFilesTests(unittest.TestCase):
 
         [result] = results
         self.assertEqual(result.status, "pass")
-
-
-class LoadTrialBalanceCsvTests(unittest.TestCase):
-    def _write_csv(self, tmpdir, content):
-        path = Path(tmpdir) / "tb.csv"
-        path.write_text(content)
-        return str(path)
-
-    def test_loads_valid_csv(self):
-        content = (
-            "Ledger Name,Group,Debit,Credit\n"
-            "Cash in Hand,Cash-in-Hand,63168.89,0.00\n"
-            "Partner's Capital Account,Capital Account,0.00,11640156.50\n"
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self._write_csv(tmpdir, content)
-            rows = load_trial_balance_csv(path)
-
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0].name, "Cash in Hand")
-        self.assertEqual(rows[0].debit, Decimal("63168.89"))
-        self.assertEqual(rows[1].net_balance, Decimal("-11640156.50"))
-
-    def test_duplicate_ledger_name_raises(self):
-        content = (
-            "Ledger Name,Group,Debit,Credit\n"
-            "Cash in Hand,Cash-in-Hand,1000.00,0.00\n"
-            "Cash in Hand,Cash-in-Hand,2000.00,0.00\n"
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self._write_csv(tmpdir, content)
-            with self.assertRaises(ValueError):
-                load_trial_balance_csv(path)
-
-    def test_malformed_columns_raises(self):
-        content = "Name,Debit,Credit\nCash,100,0\n"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self._write_csv(tmpdir, content)
-            with self.assertRaises(ValueError):
-                load_trial_balance_csv(path)
-
-    def test_non_numeric_amount_raises(self):
-        content = "Ledger Name,Group,Debit,Credit\nCash in Hand,Cash-in-Hand,abc,0.00\n"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = self._write_csv(tmpdir, content)
-            with self.assertRaises(ValueError):
-                load_trial_balance_csv(path)
 
 
 if __name__ == "__main__":

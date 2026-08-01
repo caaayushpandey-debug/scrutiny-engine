@@ -1,5 +1,12 @@
 """Check: Opening Balance vs Prior Year Closing Balance.
 
+CLI usage: run as a module, not as a bare script path, since this file
+imports sibling packages (checks.requirements, checks.results,
+schemas.trial_balance) that only resolve correctly when the project root is
+on sys.path -- which `python3 -m` sets up automatically and a bare
+`python3 checks/opening_balance_vs_prior_year_closing.py` does not:
+    python3 -m checks.opening_balance_vs_prior_year_closing prior.csv current.csv
+
 Status: FINAL (per CLAUDE.md HARD RULE #4). Validated by
 tests/verify_against_data_synthesizer.py against 5 real data-synthesizer
 sample companies (2 clean, 3 with 2/3/4 deliberately injected errors) --
@@ -18,15 +25,16 @@ financial year closed with. Any deviation means either a data-entry error, an
 unrecorded adjustment, or the books were tampered with between year-end close
 and year-open.
 
-Input format
-------------
-Both input files are CSVs with the header `Ledger Name,Group,Debit,Credit`,
-one row per ledger, matching the shape produced by the `data-synthesizer`
-project's trial balance generator. Exactly one of Debit/Credit is expected to
-be non-zero per row (the ledger's normal balance side); this check does not
-assume that, though -- it computes a signed net balance
-(`debit - credit`) per ledger, which is correct for that format and also
-degrades gracefully if a future input has both columns populated.
+Data requirements (see checks/requirements.py, checks/registry.py,
+coordinator.py)
+-----------------------------------------------------------------
+This check needs two TrialBalance documents (schemas.trial_balance) in two
+different scopes -- see DATA_REQUIREMENTS below and CLAUDE.md HARD RULE #7
+"Document scope model":
+- prior_year_trial_balance: DocumentScope.PERIOD_SCOPED_PRIOR_YEAR -- last
+  year's audited closing trial balance, uploaded once at FY setup.
+- current_year_trial_balance: DocumentScope.VERSION_SCOPED -- the specific
+  version being scrutinized's opening trial balance.
 
 Ledger matching
 ----------------
@@ -40,7 +48,7 @@ a bug; a name-similarity check would be a separate, fuzzier check.
 
 Duplicate ledger names within a single input file are treated as a data
 error and raise ValueError rather than being silently resolved, since which
-one is "the real" balance would be ambiguous.
+one is "the real" balance would be ambiguous (see schemas/trial_balance.py).
 
 ASSUMPTION (flagged per CLAUDE.md HARD RULE #5, though this is an accounting
 convention rather than a tax-law question specifically): this check assumes
@@ -82,100 +90,40 @@ explanation, same as an amount mismatch.
 status="insufficient_data" is reserved for when the check cannot run at all:
 an unreadable, missing, or unparseable input file. See run_check_from_files,
 which is where that's handled -- run_check itself assumes it has already
-been given well-formed LedgerBalance lists and never returns
+been given well-formed TrialBalance objects and never returns
 insufficient_data.
 """
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-from dataclasses import asdict, dataclass, field
-from decimal import Decimal, InvalidOperation
-from typing import List, Optional
+from decimal import Decimal
+from typing import List
+
+from checks.requirements import DataRequirement
+from checks.results import CheckResult, SourceReference
+from schemas.enums import DocumentScope, DocumentType
+from schemas.trial_balance import LedgerBalance, TrialBalance
 
 CHECK_ID = "opening_balance_vs_prior_year_closing"
+CHECK_NAME = "Opening Balance vs Prior Year Closing Balance"
 
 DEFAULT_TOLERANCE = Decimal("1.00")  # see module docstring "Tolerance"
 
-
-@dataclass
-class LedgerBalance:
-    name: str
-    group: str
-    debit: Decimal
-    credit: Decimal
-
-    @property
-    def net_balance(self) -> Decimal:
-        return self.debit - self.credit
-
-
-@dataclass
-class SourceReference:
-    ledger: Optional[str] = None
-    voucher_number: Optional[str] = None  # not applicable to this check
-    date: Optional[str] = None  # not applicable to this check
-
-
-@dataclass
-class CheckResult:
-    check_id: str
-    status: str  # "pass" | "flagged" | "insufficient_data"
-    confidence_score: float
-    description: str
-    amount: Optional[Decimal]
-    source_reference: SourceReference = field(default_factory=SourceReference)
-    # HARD RULE #6: populated only when status == "flagged"; None otherwise.
-    finding: Optional[str] = None
-    potential_implication: Optional[str] = None
-    recommended_manual_check: Optional[str] = None
-    why_correction_matters: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["amount"] = float(self.amount) if self.amount is not None else None
-        return d
-
-
-def load_trial_balance_csv(path: str) -> List[LedgerBalance]:
-    """Parses a trial balance CSV in the `Ledger Name,Group,Debit,Credit`
-    shape into LedgerBalance records. Raises ValueError on a malformed row
-    or a duplicate ledger name within the file, and OSError (e.g.
-    FileNotFoundError) if the file can't be read.
-    """
-    rows: List[LedgerBalance] = []
-    seen_names = set()
-
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        expected_columns = {"Ledger Name", "Group", "Debit", "Credit"}
-        if reader.fieldnames is None or not expected_columns.issubset(set(reader.fieldnames)):
-            raise ValueError(
-                f"{path}: expected columns {sorted(expected_columns)}, "
-                f"got {reader.fieldnames}"
-            )
-
-        for line_num, row in enumerate(reader, start=2):  # header is line 1
-            name = row["Ledger Name"].strip()
-            if not name:
-                raise ValueError(f"{path}:{line_num}: empty Ledger Name")
-            if name in seen_names:
-                raise ValueError(
-                    f"{path}:{line_num}: duplicate ledger name '{name}' -- "
-                    "ambiguous which balance is authoritative, refusing to guess"
-                )
-            seen_names.add(name)
-
-            try:
-                debit = Decimal(row["Debit"].strip())
-                credit = Decimal(row["Credit"].strip())
-            except InvalidOperation as e:
-                raise ValueError(f"{path}:{line_num}: non-numeric Debit/Credit for '{name}'") from e
-
-            rows.append(LedgerBalance(name=name, group=row["Group"].strip(), debit=debit, credit=credit))
-
-    return rows
+DATA_REQUIREMENTS: List[DataRequirement] = [
+    DataRequirement(
+        role="prior_year_trial_balance",
+        document_type=DocumentType.TRIAL_BALANCE,
+        scope=DocumentScope.PERIOD_SCOPED_PRIOR_YEAR,
+        description="Prior year closing trial balance",
+    ),
+    DataRequirement(
+        role="current_year_trial_balance",
+        document_type=DocumentType.TRIAL_BALANCE,
+        scope=DocumentScope.VERSION_SCOPED,
+        description="Current year (this version's) trial balance",
+    ),
+]
 
 
 def _format_inr(amount: Decimal) -> str:
@@ -311,17 +259,17 @@ def _amount_mismatch(name: str, prior: LedgerBalance, current: LedgerBalance, di
 
 
 def run_check(
-    prior_year_rows: List[LedgerBalance],
-    current_year_rows: List[LedgerBalance],
+    prior_year_trial_balance: TrialBalance,
+    current_year_trial_balance: TrialBalance,
     tolerance: Decimal = DEFAULT_TOLERANCE,
 ) -> List[CheckResult]:
-    """Compares two already-loaded lists of LedgerBalance records. Assumes
-    well-formed input (use load_trial_balance_csv or run_check_from_files to
+    """Compares two already-loaded TrialBalance documents. Assumes
+    well-formed input (use TrialBalance.from_csv or run_check_from_files to
     get there) -- this function never returns status="insufficient_data";
     see module docstring "status semantics".
     """
-    prior_by_name = {r.name: r for r in prior_year_rows}
-    current_by_name = {r.name: r for r in current_year_rows}
+    prior_by_name = {r.name: r for r in prior_year_trial_balance.ledgers}
+    current_by_name = {r.name: r for r in current_year_trial_balance.ledgers}
 
     all_names = sorted(set(prior_by_name) | set(current_by_name))
     results: List[CheckResult] = []
@@ -372,7 +320,7 @@ def run_check_from_files(
     whatever is calling this check.
     """
     try:
-        prior_rows = load_trial_balance_csv(prior_year_csv_path)
+        prior_tb = TrialBalance.from_csv(prior_year_csv_path)
     except (ValueError, OSError) as e:
         return [CheckResult(
             check_id=CHECK_ID,
@@ -387,7 +335,7 @@ def run_check_from_files(
         )]
 
     try:
-        current_rows = load_trial_balance_csv(current_year_csv_path)
+        current_tb = TrialBalance.from_csv(current_year_csv_path)
     except (ValueError, OSError) as e:
         return [CheckResult(
             check_id=CHECK_ID,
@@ -401,7 +349,7 @@ def run_check_from_files(
             source_reference=SourceReference(),
         )]
 
-    return run_check(prior_rows, current_rows, tolerance=tolerance)
+    return run_check(prior_tb, current_tb, tolerance=tolerance)
 
 
 def main():

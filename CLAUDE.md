@@ -57,6 +57,21 @@ for a CA/CPA audit tool.
    `"pass"` and `"insufficient_data"` results only need the existing plain
    `description` field — this richer structure exists specifically because
    `"flagged"` is what a CA actually has to act on.
+7. Every document type has exactly one of three scopes, and every check must
+   declare its data requirements using them (`document_type` + `scope`),
+   never a hardcoded file path:
+   - `version_scoped`: tied to a specific client + FY + version — changes
+     with every new Tally data upload (e.g. the current-period Trial
+     Balance/Tally data for the version being scrutinized).
+   - `period_scoped_external`: tied to a client + FY, uploaded once, reused
+     across every version (e.g. GSTR1, GSTR2, GSTR3B, TDSReturn, Form26AS,
+     PFESICChallan, BankStatement, PayrollReport).
+   - `period_scoped_prior_year`: tied to a client + FY, uploaded once at FY
+     setup (before V1 exists), reused across every version — specifically
+     last year's audited closing Tally/Trial Balance data, which does not
+     change as current-year versions are revised.
+   See "Document scope model" below for the full rationale and how the
+   coordinator resolves each scope.
 
 ## WORKING RULE
 At the end of any task or meaningful chunk of work, always run git add, git
@@ -82,14 +97,70 @@ commit with a clear descriptive message, and git push.
   `"insufficient_data"`.
 - [Fill in more conventions as they're established.]
 
+## Document scope model
+This is the shared data layer every check builds on (HARD RULE #7) — so no
+check has to reinvent how it finds and reads its own input.
+
+A client's audit work for a financial year has one prior-year closing
+position, one set of external filed documents (GST returns, TDS/26AS, bank
+statements, payroll), and potentially many *versions* of the current year's
+Tally data as it gets revised over time. A check's data requirement needs to
+say which of those three things it means, because "has the document been
+provided" resolves completely differently for each:
+
+- **`version_scoped`** documents are resolved against the *specific version*
+  being scrutinized. A Trial Balance uploaded for version 2 does not satisfy
+  a `version_scoped` requirement when version 3 is what's being checked.
+- **`period_scoped_external`** and **`period_scoped_prior_year`** documents
+  are resolved against the *FY as a whole*, independent of which version is
+  being scrutinized — they're uploaded once and every version reuses the
+  same copy.
+
+`TrialBalance` is the one document type that legitimately appears in two
+different scopes depending on role: this year's opening/current data is
+`version_scoped`, while last year's audited closing balance is
+`period_scoped_prior_year`. Every other document type currently defined has
+exactly one scope (see `schemas/enums.py`'s `DEFAULT_SCOPE_BY_DOCUMENT_TYPE`).
+
+Implementation, so a future session can find the pieces:
+- `schemas/enums.py` — `DocumentScope`, `DocumentType`.
+- `schemas/<document_type>.py` — one module per document type; see Structure.
+- `checks/requirements.py` — `DataRequirement`, the shape a check declares
+  its needs in (`role`, `document_type`, `scope`, `description`).
+- `checks/registry.py` — `CHECK_REGISTRY`, mapping every check to its
+  `DataRequirement`s. Add an entry here for every new check.
+- `coordinator.py` — `AvailableDocuments` (what's been uploaded for a
+  client/FY, as version-scoped-by-version-id and period-scoped sets) and
+  `evaluate_check_readiness`/`evaluate_all_checks`, which report per check
+  whether it `can_run` and, if not, exactly which `DataRequirement`(s) are
+  `missing`. This only answers "is the data there yet" — it does not load
+  documents or execute checks; that's each check's own `run_check`/
+  `run_check_from_files`.
+
 ## Structure (update as it grows)
+- `schemas/` — one module per document type, each independently importable.
+  `schemas/trial_balance.py` (`LedgerBalance`, `TrialBalance`) is fully
+  defined. The rest (`gstr1.py`, `gstr2.py`, `gstr3b.py`, `tds_return.py`,
+  `form_26as.py`, `pf_esic_challan.py`, `bank_statement.py`,
+  `payroll_report.py`) are placeholders — flesh each out when the first
+  check that consumes it is built. `schemas/enums.py` holds `DocumentScope`
+  and `DocumentType`. `schemas/__init__.py` re-exports everything.
 - `checks/` — one module per check, each independently importable and
-  independently testable.
-- `tests/` — one test module per check, using hand-built fixtures for basic
-  sanity coverage, plus real `data-synthesizer` output + `answer_key.json`
-  for the HARD RULE #4 final validation (`verify_against_data_synthesizer.py`
-  is the reusable harness for that; it's a standalone script, not part of
-  `python3 -m unittest discover`).
+  independently testable. `checks/results.py` (`CheckResult`,
+  `SourceReference`) and `checks/requirements.py` (`DataRequirement`) are
+  shared infrastructure every check imports rather than redefining.
+  `checks/registry.py` lists every check.
+- `coordinator.py` — see "Document scope model" above.
+- `tests/` — one test module per check/schema module, using hand-built
+  fixtures for basic sanity coverage, plus real `data-synthesizer` output +
+  `answer_key.json` for the HARD RULE #4 final validation
+  (`verify_against_data_synthesizer.py` is the reusable harness for that;
+  it's a standalone script, not part of `python3 -m unittest discover`).
+- A check module that imports sibling packages (i.e. any check built after
+  the schemas/registry/coordinator layer landed) must be run as
+  `python3 -m checks.<module_name> ...`, not as a bare script path — see
+  the "CLI usage" note at the top of
+  `checks/opening_balance_vs_prior_year_closing.py` for why.
 
 ## Checks status
 - `opening_balance_vs_prior_year_closing.py` — **FINAL.** Validated against 5
@@ -97,5 +168,9 @@ commit with a clear descriptive message, and git push.
   errors); every injected error flagged, no false positives, amounts match
   the answer key to the paisa, and every flagged result carries all four
   HARD RULE #6 structured explanation fields, non-empty. Missing-ledger
-  cases are `"flagged"` (not `"insufficient_data"`) — see the module's own
-  docstring for details.
+  cases are `"flagged"` (not `"insufficient_data"`). Re-validated after
+  being migrated onto the shared schemas/registry/coordinator data layer —
+  see the module's own docstring for details. Declares two
+  `DataRequirement`s: prior-year trial balance
+  (`period_scoped_prior_year`) and current-year trial balance
+  (`version_scoped`).

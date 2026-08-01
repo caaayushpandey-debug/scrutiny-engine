@@ -35,7 +35,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from checks.opening_balance_vs_prior_year_closing import load_trial_balance_csv, run_check
+from checks.opening_balance_vs_prior_year_closing import run_check
+from schemas.trial_balance import TrialBalance
 
 AMOUNT_EPSILON = Decimal("0.01")
 FLAGGED_DETAIL_FIELDS = ("finding", "potential_implication", "recommended_manual_check", "why_correction_matters")
@@ -55,9 +56,9 @@ def verify_company(company_dir: Path) -> list:
     with open(answer_key_path) as f:
         answer_key = json.load(f)
 
-    prior_rows = load_trial_balance_csv(str(prior_path))
-    current_rows = load_trial_balance_csv(str(current_path))
-    results = run_check(prior_rows, current_rows)
+    prior_tb = TrialBalance.from_csv(str(prior_path))
+    current_tb = TrialBalance.from_csv(str(current_path))
+    results = run_check(prior_tb, current_tb)
 
     expected_flags = {
         e["ledger_name"]: Decimal(str(e["delta"])).copy_abs()
