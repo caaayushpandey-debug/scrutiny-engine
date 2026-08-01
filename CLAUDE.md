@@ -62,7 +62,13 @@ commit with a clear descriptive message, and git push.
 - `checks/` — one module per check, each independently importable and
   independently testable.
 - `tests/` — one test module per check, using hand-built fixtures for basic
-  sanity coverage plus (once available) real `data-synthesizer` output +
-  `answer_key.json` for the HARD RULE #4 final validation.
-- `checks/opening_balance_vs_prior_year_closing.py` — check #1, see its
-  docstring for details.
+  sanity coverage, plus real `data-synthesizer` output + `answer_key.json`
+  for the HARD RULE #4 final validation (`verify_against_data_synthesizer.py`
+  is the reusable harness for that; it's a standalone script, not part of
+  `python3 -m unittest discover`).
+
+## Checks status
+- `opening_balance_vs_prior_year_closing.py` — **FINAL.** Validated against 5
+  real data-synthesizer sample companies (2 clean, 3 with 2/3/4 injected
+  errors); every injected error flagged, no false positives, amounts match
+  the answer key to the paisa. See the module's own docstring for details.

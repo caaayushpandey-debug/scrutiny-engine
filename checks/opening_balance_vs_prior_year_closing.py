@@ -1,5 +1,12 @@
 """Check: Opening Balance vs Prior Year Closing Balance.
 
+Status: FINAL (per CLAUDE.md HARD RULE #4). Validated by
+tests/verify_against_data_synthesizer.py against 5 real data-synthesizer
+sample companies (2 clean, 3 with 2/3/4 deliberately injected errors) --
+every injected error was flagged, no ledger was flagged that wasn't in the
+answer key, and every reported discrepancy amount matched the answer key's
+recorded delta to the paisa. See that script's output for the full record.
+
 Reconciles a "current year opening" trial balance against the same company's
 "prior year closing" trial balance, ledger by ledger. This is a basic
 accounting continuity check: for a permanent (balance-sheet) ledger, the

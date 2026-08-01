@@ -1,12 +1,13 @@
 """Basic sanity tests for checks/opening_balance_vs_prior_year_closing.py,
 using small hand-built fixtures.
 
-NOTE: per CLAUDE.md HARD RULE #4, this check cannot be called "final" on the
-strength of these tests alone -- they only prove the matching/tolerance/
-missing-ledger logic behaves as intended on a few constructed examples. The
-required final validation is against real `data-synthesizer` output plus its
-answer_key.json, run programmatically (see test_against_data_synthesizer.py,
-not yet written -- waiting on sample files).
+NOTE: these tests alone only prove the matching/tolerance/missing-ledger
+logic behaves as intended on a few constructed examples -- they are not what
+makes this check "final" under CLAUDE.md HARD RULE #4. That validation is in
+tests/verify_against_data_synthesizer.py, which runs the check against real
+data-synthesizer output and diffs the result against each company's
+answer_key.json programmatically. It has been run and passed; see that
+script's docstring and the check module's own docstring for the result.
 """
 import tempfile
 import unittest
