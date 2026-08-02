@@ -83,6 +83,13 @@ commit with a clear descriptive message, and git push.
   `data-synthesizer`, and avoids repeating the environment-setup friction hit
   in the frontend project. Tests use the built-in `unittest` module, not
   pytest, for the same reason.
+  - **Exception: `api.py`** (added 2026-08-02). FastAPI + uvicorn, installed
+    into `./venv` (gitignored; recreate with `python3 -m venv venv && ./venv/bin/pip
+    install -r requirements.txt`). This is the one deliberate exception —
+    exposing a check over HTTP for the frontend to call is a real network
+    service, not something worth hand-rolling on stdlib `http.server` for.
+    Every check module underneath it stays stdlib-only; only the HTTP layer
+    itself has this dependency.
 - Money values are handled with `decimal.Decimal`, never `float`, to avoid
   floating-point rounding noise being confused with genuine discrepancies.
 - `confidence_score` is 1.0 for every fully deterministic check (per HARD
@@ -161,6 +168,27 @@ Implementation, so a future session can find the pieces:
   `python3 -m checks.<module_name> ...`, not as a bare script path — see
   the "CLI usage" note at the top of
   `checks/opening_balance_vs_prior_year_closing.py` for why.
+- `api.py` — minimal FastAPI service exposing checks over HTTP (see
+  "Conventions" exception above). One endpoint so far:
+  `POST /run-checks` — wraps check #1 specifically (not a generic
+  registry-driven dispatcher yet). Request body: `prior_year_trial_balance`
+  and `current_year_trial_balance`, each `{"ledgers": [{"name", "group",
+  "debit", "credit"}, ...]}` — pass `debit`/`credit` as JSON strings (e.g.
+  `"45200000.00"`) to guarantee exact `Decimal` precision, not plain JSON
+  numbers. Optional `tolerance` (string, rupees) overrides the check's
+  default. Returns a JSON array of `CheckResult.to_dict()` — the same shape
+  `checks/opening_balance_vs_prior_year_closing.py`'s own `main()` prints.
+  `GET /health` for a basic liveness check. Auto-generated interactive docs
+  at `/docs` once running.
+  Run locally: `./venv/bin/uvicorn api:app --reload --port 8000`.
+  Tested (2026-08-02): `tests/test_api_manual.py` posts a real
+  data-synthesizer sample (the 4-error company) through the running API and
+  confirms the flagged ledgers exactly match that sample's answer key — same
+  standard this project already held the check module itself to (HARD RULE
+  #4), now proven through the HTTP layer too, not just the Python function
+  call. Also manually verified: empty-input 400, malformed-input 422 with
+  field-level detail, custom `tolerance` override, and Decimal precision
+  round-tripping correctly through JSON.
 
 ## Checks status
 - `opening_balance_vs_prior_year_closing.py` — **FINAL.** Validated against 5
