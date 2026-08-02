@@ -221,7 +221,7 @@ Implementation, so a future session can find the pieces:
   the "CLI usage" note at the top of
   `checks/opening_balance_vs_prior_year_closing.py` for why.
 - `api.py` — minimal FastAPI service exposing checks over HTTP (see
-  "Conventions" exception above). Two endpoints so far:
+  "Conventions" exception above). Three endpoints so far:
   - `POST /run-checks` — wraps check #1 specifically (not a generic
     registry-driven dispatcher yet). Request body: `prior_year_trial_balance`
     and `current_year_trial_balance`, each `{"ledgers": [{"name", "group",
@@ -239,6 +239,24 @@ Implementation, so a future session can find the pieces:
     accepted vs rejected (422 with a specific reason: which required column
     couldn't be found and what the actual headers were, or which row/ledger
     had an unparseable amount).
+  - `POST /parse-tally-xml` (added 2026-08-02) — raw Tally XML file upload
+    (multipart/form-data, field name `file`) → the full structured
+    `TallyData` shape: `{"ledgers": [{"name", "parent", "opening_balance"}],
+    "vouchers": [{"vch_type", "voucher_number", "date", "narration",
+    "legs": [{"ledger_name", "is_debit", "amount"}]}]}` (amounts as strings,
+    same Decimal-precision reasoning as `/parse-trial-balance`). Parsing
+    logic lives in `tally_xml_parser.py`'s `parse_tally_xml_data` (see
+    "Structure" above) — 422 with the parser's own error message on
+    malformed input (not well-formed XML, wrong root element, sign-
+    convention violations, unbalanced vouchers, etc). Not yet wired to a
+    check endpoint the way `/parse-trial-balance` feeds `/run-checks` --
+    `checks/suspense_account_scrutiny.py` (the check actually validated
+    against this data) has no HTTP endpoint yet, only a CLI entry point.
+    Manually verified (2026-08-02) via curl against all 5 real
+    data-synthesizer Tally XML samples: correct ledger/voucher counts for
+    each, and the 4-error company's known phantom voucher (`JV-0012` on
+    "Axis Bank CC A/c") round-trips through the endpoint with the exact
+    same amount as `answer_key.json`. A non-XML file correctly returns 422.
   - `GET /health` for a basic liveness check. Auto-generated interactive docs
     at `/docs` once running.
   Run locally: `./venv/bin/uvicorn api:app --reload --port 8000`.

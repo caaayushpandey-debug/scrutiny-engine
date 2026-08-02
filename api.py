@@ -11,7 +11,7 @@ to be called over the network.
 Run locally:
     ./venv/bin/uvicorn api:app --reload --port 8000
 
-Two endpoints exist:
+Endpoints:
 - POST /run-checks, wrapping check #1 specifically -- this is not a generic
   "run any check by ID" dispatcher. If/when more checks are added, revisit
   whether this should become registry-driven (see coordinator.py /
@@ -20,6 +20,11 @@ Two endpoints exist:
   preprocessing step (see trial_balance_csv_parser.py for the tolerant
   parsing logic), so the frontend doesn't have to parse Trial Balance CSVs
   itself before calling /run-checks.
+- POST /parse-tally-xml, a raw-Tally-XML-upload -> structured TallyData
+  ({"ledgers": [...], "vouchers": [...]}) preprocessing step (see
+  tally_xml_parser.py). Not yet wired to any check endpoint the way
+  /parse-trial-balance feeds /run-checks -- checks/suspense_account_scrutiny.py,
+  the check actually validated against this data, has no HTTP endpoint yet.
 """
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ from pydantic import BaseModel, Field
 
 from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check
 from schemas.trial_balance import LedgerBalance, TrialBalance
+from tally_xml_parser import TallyXmlParseError, parse_tally_xml_data
 from trial_balance_csv_parser import TrialBalanceParseError, parse_trial_balance_csv
 
 app = FastAPI(
@@ -120,4 +126,41 @@ async def parse_trial_balance(file: UploadFile = File(...)) -> dict:
             {"name": l.name, "group": l.group, "debit": str(l.debit), "credit": str(l.credit)}
             for l in trial_balance.ledgers
         ]
+    }
+
+
+@app.post("/parse-tally-xml")
+async def parse_tally_xml(file: UploadFile = File(...)) -> dict:
+    """Parses an uploaded Tally XML export into the full structured
+    TallyData shape -- every ledger master (name, parent, opening_balance)
+    and every voucher (voucher_number, date, narration, legs), not just a
+    collapsed trial balance. debit/credit-equivalent amounts are returned as
+    strings, same Decimal-precision reasoning as /parse-trial-balance. Takes
+    raw bytes from the upload directly (no text-decode step) -- Tally XML
+    declares its own encoding, see tally_xml_parser.py's module docstring.
+    """
+    raw = await file.read()
+    try:
+        tally_data = parse_tally_xml_data(raw)
+    except TallyXmlParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return {
+        "ledgers": [
+            {"name": m.name, "parent": m.parent, "opening_balance": str(m.opening_balance)}
+            for m in tally_data.ledgers.values()
+        ],
+        "vouchers": [
+            {
+                "vch_type": v.vch_type,
+                "voucher_number": v.voucher_number,
+                "date": v.date,
+                "narration": v.narration,
+                "legs": [
+                    {"ledger_name": leg.ledger_name, "is_debit": leg.is_debit, "amount": str(leg.amount)}
+                    for leg in v.legs
+                ],
+            }
+            for v in tally_data.vouchers
+        ],
     }
