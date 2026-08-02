@@ -22,9 +22,12 @@ Endpoints:
   itself before calling /run-checks.
 - POST /parse-tally-xml, a raw-Tally-XML-upload -> structured TallyData
   ({"ledgers": [...], "vouchers": [...]}) preprocessing step (see
-  tally_xml_parser.py). Not yet wired to any check endpoint the way
-  /parse-trial-balance feeds /run-checks -- checks/suspense_account_scrutiny.py,
-  the check actually validated against this data, has no HTTP endpoint yet.
+  tally_xml_parser.py).
+- POST /run-suspense-check, wrapping checks/suspense_account_scrutiny.py
+  specifically (same one-check-per-endpoint approach as /run-checks, not a
+  registry-driven dispatcher). Takes the same TallyData shape
+  /parse-tally-xml returns, so the two chain directly: upload Tally XML to
+  /parse-tally-xml, feed its response straight into /run-suspense-check.
 """
 from __future__ import annotations
 
@@ -35,6 +38,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check
+from checks.suspense_account_scrutiny import run_check as run_suspense_account_scrutiny
+from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
 from tally_xml_parser import TallyXmlParseError, parse_tally_xml_data
 from trial_balance_csv_parser import TrialBalanceParseError, parse_trial_balance_csv
@@ -127,6 +132,60 @@ async def parse_trial_balance(file: UploadFile = File(...)) -> dict:
             for l in trial_balance.ledgers
         ]
     }
+
+
+class TallyLedgerMasterIn(BaseModel):
+    name: str = Field(..., description="Ledger name, e.g. 'Axis Bank CC A/c'")
+    parent: str = Field(..., description="Accounting group, e.g. 'Bank Accounts'")
+    opening_balance: Decimal = Field(..., description="Opening balance as a string, e.g. \"100000.00\"")
+
+
+class TallyVoucherLegIn(BaseModel):
+    ledger_name: str
+    is_debit: bool
+    amount: Decimal = Field(..., description="Tally's own signed AMOUNT, as a string -- see tally_xml_parser.py's sign convention notes")
+
+
+class TallyVoucherIn(BaseModel):
+    vch_type: str
+    voucher_number: str
+    date: str
+    narration: str = ""
+    legs: List[TallyVoucherLegIn]
+
+
+class TallyDataIn(BaseModel):
+    ledgers: List[TallyLedgerMasterIn]
+    vouchers: List[TallyVoucherIn]
+
+    def to_domain(self) -> TallyData:
+        return TallyData(
+            ledgers={m.name: TallyLedgerMaster(name=m.name, parent=m.parent, opening_balance=m.opening_balance) for m in self.ledgers},
+            vouchers=[
+                TallyVoucher(
+                    vch_type=v.vch_type,
+                    voucher_number=v.voucher_number,
+                    date=v.date,
+                    narration=v.narration,
+                    legs=[TallyVoucherLeg(ledger_name=l.ledger_name, is_debit=l.is_debit, amount=l.amount) for l in v.legs],
+                )
+                for v in self.vouchers
+            ],
+        )
+
+
+@app.post("/run-suspense-check")
+def run_suspense_check(request: TallyDataIn) -> List[dict]:
+    """Runs checks/suspense_account_scrutiny.py against the supplied
+    TallyData and returns its results in the standard CheckResult shape
+    (CLAUDE.md HARD RULE #2/#6). Accepts exactly the shape /parse-tally-xml
+    returns, so the two endpoints chain directly.
+    """
+    if not request.ledgers and not request.vouchers:
+        raise HTTPException(status_code=400, detail="Tally data is empty -- nothing to check.")
+
+    results = run_suspense_account_scrutiny(request.to_domain())
+    return [r.to_dict() for r in results]
 
 
 @app.post("/parse-tally-xml")

@@ -221,7 +221,7 @@ Implementation, so a future session can find the pieces:
   the "CLI usage" note at the top of
   `checks/opening_balance_vs_prior_year_closing.py` for why.
 - `api.py` — minimal FastAPI service exposing checks over HTTP (see
-  "Conventions" exception above). Three endpoints so far:
+  "Conventions" exception above). Four endpoints so far:
   - `POST /run-checks` — wraps check #1 specifically (not a generic
     registry-driven dispatcher yet). Request body: `prior_year_trial_balance`
     and `current_year_trial_balance`, each `{"ledgers": [{"name", "group",
@@ -257,6 +257,22 @@ Implementation, so a future session can find the pieces:
     each, and the 4-error company's known phantom voucher (`JV-0012` on
     "Axis Bank CC A/c") round-trips through the endpoint with the exact
     same amount as `answer_key.json`. A non-XML file correctly returns 422.
+  - `POST /run-suspense-check` (added 2026-08-02) — wraps
+    `checks/suspense_account_scrutiny.py` specifically (same one-check-per-
+    endpoint approach as `/run-checks`, not a registry-driven dispatcher).
+    Request body is exactly the `TallyData` shape `/parse-tally-xml`
+    returns (`{"ledgers": [...], "vouchers": [...]}`, amounts as strings),
+    so the two chain directly: upload Tally XML to `/parse-tally-xml`, feed
+    its response straight into `/run-suspense-check`. Returns the standard
+    `CheckResult.to_dict()` array. `tests/test_api_manual_suspense.py` is
+    the full-stack harness (same pattern as `test_api_manual.py`): uploads
+    each real data-synthesizer Tally XML sample's raw file through both
+    endpoints in sequence and confirms the flagged results match that
+    sample's `answer_key.json` exactly — verified passing across all 5
+    companies, the same result
+    `verify_suspense_account_scrutiny_against_data_synthesizer.py` already
+    proved at the Python-function level, now confirmed reachable over HTTP
+    too.
   - `GET /health` for a basic liveness check. Auto-generated interactive docs
     at `/docs` once running.
   Run locally: `./venv/bin/uvicorn api:app --reload --port 8000`.
