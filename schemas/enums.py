@@ -27,6 +27,7 @@ class DocumentScope(str, Enum):
 
 class DocumentType(str, Enum):
     TRIAL_BALANCE = "trial_balance"
+    TALLY_DATA = "tally_data"
     GSTR1 = "gstr1"
     GSTR2 = "gstr2"
     GSTR3B = "gstr3b"
@@ -44,8 +45,12 @@ class DocumentType(str, Enum):
 # closing balance. Every check that needs a TrialBalance must state which
 # scope it means for that specific requirement (see checks/requirements.py
 # DataRequirement); there is no single sensible default for it, so looking
-# it up here would silently paper over a real ambiguity.
+# it up here would silently paper over a real ambiguity. TALLY_DATA has no
+# such ambiguity -- unlike TRIAL_BALANCE, no check needs "last year's Tally
+# data" as a distinct role, only the current version's, so it's safe to
+# default here.
 DEFAULT_SCOPE_BY_DOCUMENT_TYPE = {
+    DocumentType.TALLY_DATA: DocumentScope.VERSION_SCOPED,
     DocumentType.GSTR1: DocumentScope.PERIOD_SCOPED_EXTERNAL,
     DocumentType.GSTR2: DocumentScope.PERIOD_SCOPED_EXTERNAL,
     DocumentType.GSTR3B: DocumentScope.PERIOD_SCOPED_EXTERNAL,

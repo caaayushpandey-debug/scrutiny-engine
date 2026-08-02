@@ -1,5 +1,6 @@
 from .enums import DEFAULT_SCOPE_BY_DOCUMENT_TYPE, DocumentScope, DocumentType
 from .trial_balance import LedgerBalance, TrialBalance
+from .tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from .gstr1 import GSTR1
 from .gstr2 import GSTR2
 from .gstr3b import GSTR3B
@@ -15,6 +16,10 @@ __all__ = [
     "DEFAULT_SCOPE_BY_DOCUMENT_TYPE",
     "LedgerBalance",
     "TrialBalance",
+    "TallyData",
+    "TallyLedgerMaster",
+    "TallyVoucher",
+    "TallyVoucherLeg",
     "GSTR1",
     "GSTR2",
     "GSTR3B",

@@ -146,12 +146,20 @@ Implementation, so a future session can find the pieces:
 
 ## Structure (update as it grows)
 - `schemas/` — one module per document type, each independently importable.
-  `schemas/trial_balance.py` (`LedgerBalance`, `TrialBalance`) is fully
-  defined. The rest (`gstr1.py`, `gstr2.py`, `gstr3b.py`, `tds_return.py`,
+  `schemas/trial_balance.py` (`LedgerBalance`, `TrialBalance`) and
+  `schemas/tally_data.py` (`TallyLedgerMaster`, `TallyVoucher`,
+  `TallyVoucherLeg`, `TallyData`) are fully defined. `TallyData` keeps full
+  ledger-master + voucher-leg detail (unlike `TrialBalance`'s one-number-
+  per-ledger shape) because a Tally ledger's closing balance isn't a single
+  stored field — see `TallyData.closing_balance()` and `tally_xml_parser.py`.
+  The rest (`gstr1.py`, `gstr2.py`, `gstr3b.py`, `tds_return.py`,
   `form_26as.py`, `pf_esic_challan.py`, `bank_statement.py`,
   `payroll_report.py`) are placeholders — flesh each out when the first
   check that consumes it is built. `schemas/enums.py` holds `DocumentScope`
-  and `DocumentType`. `schemas/__init__.py` re-exports everything.
+  and `DocumentType` (`TALLY_DATA` added 2026-08-02, always
+  `VERSION_SCOPED` — no check needs "last year's Tally data" as a distinct
+  role the way `TRIAL_BALANCE` does). `schemas/__init__.py` re-exports
+  everything.
 - `checks/` — one module per check, each independently importable and
   independently testable. `checks/results.py` (`CheckResult`,
   `SourceReference`) and `checks/requirements.py` (`DataRequirement`) are
@@ -171,6 +179,42 @@ Implementation, so a future session can find the pieces:
   `schemas/trial_balance.py`'s strict `TrialBalance.from_csv` (which stays
   as the canonical, exact-format parser other checks can rely on). See its
   own docstring for exactly what variations are tolerated.
+- `tally_xml_parser.py` (added 2026-08-02) — Tally XML → `TallyData` /
+  `TrialBalance` parser, matching the schema `data-synthesizer`'s Tally XML
+  generator produces (see that project's
+  `generators/tally_xml/generate_tally_xml.py` for the exact schema
+  citation). Two entry points: `parse_tally_xml_data`/`parse_tally_xml_data_file`
+  return a full `TallyData` (every ledger master + every voucher, untouched);
+  `parse_tally_xml`/`parse_tally_xml_file` collapse that into a
+  `TrialBalance` of permanent (balance-sheet) ledgers' *closing* balances,
+  computed by summing every voucher leg against each ledger's opening
+  balance — not read from any single stated field. Validates Tally's
+  ISDEEMEDPOSITIVE/AMOUNT sign convention (rejects inconsistencies rather
+  than trusting one field over the other) and that every voucher's legs sum
+  to zero. Excludes Profit & Loss ledgers (Tally's own fixed primary-group
+  list: Sales/Purchase Accounts, Direct/Indirect Incomes/Expenses) from the
+  `TrialBalance` output, matching `opening_balance_vs_prior_year_closing.py`'s
+  documented balance-sheet-only assumption.
+  **KNOWN LIMITATION** (found while validating this against check #1, before
+  the fix below): `opening_balance_vs_prior_year_closing.py` tests a
+  same-point-in-time continuity fact (this year's *opening* should equal
+  last year's *closing*). A `TrialBalance` built from a full year of
+  realistic, uncorrelated trading vouchers via `parse_tally_xml` will
+  legitimately differ from the opening balance for any active ledger — real
+  business activity, not a discrepancy — and produces false positives on
+  nearly every active ledger if fed into that check. Confirmed empirically:
+  in the two *clean* (zero-injected-error) sample companies, 100% of
+  eligible ledgers were false-flagged. `parse_tally_xml`/`parse_tally_xml_file`
+  should only ever be fed a Tally file whose vouchers net to zero for the
+  year (or no vouchers at all) — never a full year of real trading data;
+  see the module's own "KNOWN LIMITATION" docstring section for the full
+  writeup. `opening_balance_vs_prior_year_closing.py` itself was not
+  changed and stays CSV/stated-balance-focused. This is why the Tally
+  pipeline's actually-validated check is `suspense_account_scrutiny.py`
+  (below), not that one.
+  Unit tests: `tests/test_tally_xml_parser.py` (22 tests: sign-convention
+  math, P&L filtering, every rejection path, `TallyData` field/method
+  coverage).
 - A check module that imports sibling packages (i.e. any check built after
   the schemas/registry/coordinator layer landed) must be run as
   `python3 -m checks.<module_name> ...`, not as a bare script path — see
@@ -227,4 +271,26 @@ Implementation, so a future session can find the pieces:
   see the module's own docstring for details. Declares two
   `DataRequirement`s: prior-year trial balance
   (`period_scoped_prior_year`) and current-year trial balance
-  (`version_scoped`).
+  (`version_scoped`). CSV/`TrialBalance`-only — deliberately NOT run against
+  Tally XML's voucher-derived data; see `tally_xml_parser.py`'s "KNOWN
+  LIMITATION" entry above for why that combination doesn't make sense.
+- `suspense_account_scrutiny.py` (added 2026-08-02) — **FINAL.** Consumes
+  `TallyData` (ledger masters + vouchers) directly, not `TrialBalance` — no
+  prior-year document needed, since it only reasons about postings within
+  one Tally file. Flags every voucher that posts through a designated
+  Suspense ledger (name-matched, see `SUSPENSE_LEDGER_NAMES` — an
+  ASSUMPTION per HARD RULE #5), one flagged result per (voucher,
+  non-Suspense leg). Built specifically because `data-synthesizer`'s Tally
+  XML generator's injected errors are, by construction, an extra Journal
+  voucher routed through "Suspense Account" — real CA audit practice
+  already always scrutinizes suspense-account activity, so this is a
+  genuine, deterministic (HARD RULE #1) check, not a test-data-specific
+  hack. Validated by
+  `tests/verify_suspense_account_scrutiny_against_data_synthesizer.py`
+  against all 5 real Tally XML sample companies: every injected error
+  flagged by its phantom voucher number, no false positives, amounts match
+  the answer key to the paisa, all four HARD RULE #6 fields present on
+  every flagged result. Declares one `DataRequirement`: current-year Tally
+  data (`version_scoped`). Unit tests:
+  `tests/test_suspense_account_scrutiny.py` (7 tests, hand-built `TallyData`
+  fixtures).
