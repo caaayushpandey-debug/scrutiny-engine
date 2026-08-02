@@ -260,6 +260,59 @@ Implementation, so a future session can find the pieces:
   422 with field-level detail, custom `tolerance` override, and Decimal
   precision round-tripping correctly through JSON.
 
+## Why check #1 and Suspense Account Scrutiny are separate checks (not a workaround)
+This came up twice while building the Tally XML pipeline (2026-08-02) and is
+settled -- do not revisit this as "we should make check #1 work on Tally
+XML" without re-reading this section first.
+
+**The two checks test two different fields, and `data-synthesizer`'s Tally
+XML generator deliberately keeps those two fields decoupled:**
+- `opening_balance_vs_prior_year_closing.py` (check #1) tests: does
+  `LEDGER.OPENINGBALANCE` (a single stated field) match the prior year's
+  audited closing balance? A same-point-in-time continuity fact.
+- `suspense_account_scrutiny.py` tests: does any voucher for the year post
+  through a designated Suspense ledger? A voucher-trail / transaction-level
+  fact.
+
+**Attempt 1 (rejected): feed check #1 the voucher-summed *closing* balance**
+(`opening_balance = opening + every voucher leg for the year`, i.e. what
+`parse_tally_xml`/`TallyData.closing_balance()` computes). Fails because a
+full year of realistic, uncorrelated trading vouchers legitimately moves an
+active ledger's balance away from its opening figure -- that's normal
+business activity, not a discrepancy. Empirically: 100% of eligible ledgers
+were false-flagged in the two *clean* (zero-injected-error) sample
+companies. See `tally_xml_parser.py`'s "KNOWN LIMITATION" docstring section
+and the "Structure" entry above.
+
+**Attempt 2 (rejected): feed check #1 the raw, unsummed `OPENINGBALANCE`
+field directly** (no voucher summing at all -- exactly what check #1's CSV
+path already does, just sourced from XML instead of a CSV cell). This
+seemed like it should work, since `OPENINGBALANCE` is always set correctly
+to the prior year's closing figure. It doesn't, and for a structural reason,
+not a bug: `data-synthesizer`'s error injection **never touches
+`OPENINGBALANCE`** -- every injected error is an extra phantom Journal
+voucher instead (see that project's `generators/tally_xml/generate_tally_xml.py`,
+"Error injection design"). So `OPENINGBALANCE` matches the prior year's
+closing balance *exactly, in every single sample company this generator can
+produce, whether or not an error was injected* -- it's true by construction,
+not something that varies with the data. Fed into check #1 this way, the
+result was 0 flagged ledgers in all 5 companies, including all 3
+error-injected ones -- every one of the 9 injected errors silently missed.
+Confirmed empirically (2026-08-02): the two clean companies correctly
+showed 0 flagged (31 and 32 ledgers, all pass), but so did the three error
+companies that should have shown 2, 3, and 4 flagged respectively.
+
+**The conclusion:** this isn't "check #1 needs more work to support Tally
+XML" -- it's that `opening_balance_vs_prior_year_closing.py` and
+`suspense_account_scrutiny.py` are two independently valid, differently-scoped
+checks, and this specific test-data generator only varies the field the
+second one looks at. Check #1 remains correct and useful for its own
+purpose (CSV-stated opening balances, or any future Tally XML error-injection
+scheme that actually tampers with `OPENINGBALANCE` -- were one to exist);
+Suspense Account Scrutiny is what actually exercises this generator's Tally
+XML voucher data. Neither is a workaround for the other; do not merge them
+or try to make one supersede the other.
+
 ## Checks status
 - `opening_balance_vs_prior_year_closing.py` — **FINAL.** Validated against 5
   real data-synthesizer sample companies (2 clean, 3 with 2/3/4 injected
