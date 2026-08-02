@@ -163,32 +163,58 @@ Implementation, so a future session can find the pieces:
   `answer_key.json` for the HARD RULE #4 final validation
   (`verify_against_data_synthesizer.py` is the reusable harness for that;
   it's a standalone script, not part of `python3 -m unittest discover`).
+  `test_api_manual.py` is the equivalent full-stack harness for `api.py` —
+  also a standalone script (needs a running server), not part of
+  `unittest discover`.
+- `trial_balance_csv_parser.py` — tolerant CSV → `TrialBalance` parser used
+  by `api.py`'s `/parse-trial-balance`, independent of and more lenient than
+  `schemas/trial_balance.py`'s strict `TrialBalance.from_csv` (which stays
+  as the canonical, exact-format parser other checks can rely on). See its
+  own docstring for exactly what variations are tolerated.
 - A check module that imports sibling packages (i.e. any check built after
   the schemas/registry/coordinator layer landed) must be run as
   `python3 -m checks.<module_name> ...`, not as a bare script path — see
   the "CLI usage" note at the top of
   `checks/opening_balance_vs_prior_year_closing.py` for why.
 - `api.py` — minimal FastAPI service exposing checks over HTTP (see
-  "Conventions" exception above). One endpoint so far:
-  `POST /run-checks` — wraps check #1 specifically (not a generic
-  registry-driven dispatcher yet). Request body: `prior_year_trial_balance`
-  and `current_year_trial_balance`, each `{"ledgers": [{"name", "group",
-  "debit", "credit"}, ...]}` — pass `debit`/`credit` as JSON strings (e.g.
-  `"45200000.00"`) to guarantee exact `Decimal` precision, not plain JSON
-  numbers. Optional `tolerance` (string, rupees) overrides the check's
-  default. Returns a JSON array of `CheckResult.to_dict()` — the same shape
-  `checks/opening_balance_vs_prior_year_closing.py`'s own `main()` prints.
-  `GET /health` for a basic liveness check. Auto-generated interactive docs
-  at `/docs` once running.
+  "Conventions" exception above). Two endpoints so far:
+  - `POST /run-checks` — wraps check #1 specifically (not a generic
+    registry-driven dispatcher yet). Request body: `prior_year_trial_balance`
+    and `current_year_trial_balance`, each `{"ledgers": [{"name", "group",
+    "debit", "credit"}, ...]}` — pass `debit`/`credit` as JSON strings (e.g.
+    `"45200000.00"`) to guarantee exact `Decimal` precision, not plain JSON
+    numbers. Optional `tolerance` (string, rupees) overrides the check's
+    default. Returns a JSON array of `CheckResult.to_dict()` — the same shape
+    `checks/opening_balance_vs_prior_year_closing.py`'s own `main()` prints.
+  - `POST /parse-trial-balance` — raw CSV file upload (multipart/form-data,
+    field name `file`) → the same `{"ledgers": [...]}` shape `/run-checks`
+    consumes (debit/credit returned as strings, same precision reasoning).
+    Parsing logic lives in `trial_balance_csv_parser.py` (see "Structure"),
+    tolerant of real-world header-name/order/currency-symbol variations but
+    never silently guessing — see that module's docstring for exactly what's
+    accepted vs rejected (422 with a specific reason: which required column
+    couldn't be found and what the actual headers were, or which row/ledger
+    had an unparseable amount).
+  - `GET /health` for a basic liveness check. Auto-generated interactive docs
+    at `/docs` once running.
   Run locally: `./venv/bin/uvicorn api:app --reload --port 8000`.
-  Tested (2026-08-02): `tests/test_api_manual.py` posts a real
-  data-synthesizer sample (the 4-error company) through the running API and
-  confirms the flagged ledgers exactly match that sample's answer key — same
-  standard this project already held the check module itself to (HARD RULE
-  #4), now proven through the HTTP layer too, not just the Python function
-  call. Also manually verified: empty-input 400, malformed-input 422 with
-  field-level detail, custom `tolerance` override, and Decimal precision
-  round-tripping correctly through JSON.
+  Tested (2026-08-02): `tests/test_api_manual.py` uploads a real
+  data-synthesizer sample's raw CSVs (the 4-error company) to
+  `/parse-trial-balance`, feeds the parsed ledgers straight into
+  `/run-checks`, and confirms the flagged ledgers exactly match that
+  sample's answer key — a genuine full-stack round trip through both
+  endpoints, not synthetic ledger JSON. Same standard this project already
+  held the check module itself to (HARD RULE #4), now proven through the
+  HTTP layer too. `trial_balance_csv_parser.py` additionally has its own
+  unit tests (`tests/test_trial_balance_csv_parser.py`) covering header
+  aliases, currency/comma/parentheses number cleanup, and every rejection
+  path, plus a verified byte-for-byte equivalence check against the
+  existing strict `TrialBalance.from_csv` for all 10 real sample CSVs (5
+  companies × prior/current) — proves the tolerant parser doesn't change
+  behavior for the canonical format, only adds tolerance for variations.
+  Also manually verified on `/run-checks`: empty-input 400, malformed-input
+  422 with field-level detail, custom `tolerance` override, and Decimal
+  precision round-tripping correctly through JSON.
 
 ## Checks status
 - `opening_balance_vs_prior_year_closing.py` — **FINAL.** Validated against 5

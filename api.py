@@ -11,21 +11,27 @@ to be called over the network.
 Run locally:
     ./venv/bin/uvicorn api:app --reload --port 8000
 
-Only one endpoint exists for now (POST /run-checks), wrapping check #1
-specifically -- this is not a generic "run any check by ID" dispatcher. If/when
-more checks are added, revisit whether this should become registry-driven
-(see coordinator.py / checks/registry.py) rather than hardcoded to one check.
+Two endpoints exist:
+- POST /run-checks, wrapping check #1 specifically -- this is not a generic
+  "run any check by ID" dispatcher. If/when more checks are added, revisit
+  whether this should become registry-driven (see coordinator.py /
+  checks/registry.py) rather than hardcoded to one check.
+- POST /parse-trial-balance, a raw-CSV-upload -> {"ledgers": [...]}
+  preprocessing step (see trial_balance_csv_parser.py for the tolerant
+  parsing logic), so the frontend doesn't have to parse Trial Balance CSVs
+  itself before calling /run-checks.
 """
 from __future__ import annotations
 
 from decimal import Decimal
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check
 from schemas.trial_balance import LedgerBalance, TrialBalance
+from trial_balance_csv_parser import TrialBalanceParseError, parse_trial_balance_csv
 
 app = FastAPI(
     title="AI Scrutiny Engine API",
@@ -87,3 +93,31 @@ def run_checks(request: RunChecksRequest) -> List[dict]:
     )
 
     return [r.to_dict() for r in results]
+
+
+@app.post("/parse-trial-balance")
+async def parse_trial_balance(file: UploadFile = File(...)) -> dict:
+    """Parses an uploaded Trial Balance CSV into the {"ledgers": [...]} shape
+    /run-checks' prior_year_trial_balance / current_year_trial_balance expect
+    (debit/credit returned as strings, to preserve exact Decimal precision the
+    same way /run-checks' own request shape does). See
+    trial_balance_csv_parser.py for exactly what CSV variations are
+    tolerated and what gets rejected.
+    """
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")  # -sig gracefully strips a BOM if present
+    except UnicodeDecodeError as e:
+        raise HTTPException(status_code=422, detail=f"Could not decode '{file.filename}' as UTF-8 text: {e}")
+
+    try:
+        trial_balance = parse_trial_balance_csv(text)
+    except TrialBalanceParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return {
+        "ledgers": [
+            {"name": l.name, "group": l.group, "debit": str(l.debit), "credit": str(l.credit)}
+            for l in trial_balance.ledgers
+        ]
+    }
