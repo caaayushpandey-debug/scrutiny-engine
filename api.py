@@ -35,6 +35,7 @@ from decimal import Decimal
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check
@@ -48,6 +49,19 @@ app = FastAPI(
     title="AI Scrutiny Engine API",
     description="Local API wrapping the scrutiny-engine's check modules.",
     version="0.1.0",
+)
+
+# The frontend (scrutiny-engine-frontend, a separate repo) runs on Vite's
+# local dev server and calls this API directly from the browser -- with no
+# CORS policy, the browser blocks every cross-origin request outright before
+# it even reaches these routes. Both are local-only dev origins today (no
+# deployed home for either service yet, see this repo's CLAUDE.md "Future
+# integration").
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
