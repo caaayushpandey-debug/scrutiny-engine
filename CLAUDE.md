@@ -261,6 +261,27 @@ Implementation, so a future session can find the pieces:
     and `VOUCHERNUMBER` are all clean. Not a structural guarantee (a
     different real export could still differ), but confirmed against the
     one real file this was found in.
+  - **A `<LEDGER>` with an empty/self-closing `<PARENT/>` is a legitimate
+    "no parent group" state, not a missing-field error** (fixed 2026-08-09,
+    a real client bug -- previously treated identically to the tag being
+    entirely absent, both raising "missing required <PARENT> element").
+    Confirmed real example: Tally's own reserved `"Profit & Loss A/c"`
+    ledger genuinely has no parent group at all, and represents that with
+    an empty `<PARENT/>`, not by omitting the tag. `_required_element_
+    optional_text` (new) requires the ELEMENT to be present but allows
+    empty text, returning `""` -- used for `PARENT` specifically; `PARENT`
+    completely ABSENT (the element itself missing, not just empty) still
+    raises, a judgment call based on every real file seen so far always
+    emitting every known field's tag (populated or not) rather than ever
+    omitting one outright -- same pattern already established for
+    `<STATKEY>` above. `OPENINGBALANCE` is unaffected and still requires
+    non-empty text (an empty opening balance isn't a valid number, unlike
+    an empty parent group, which is a real, meaningful state). An empty-
+    string `parent` resolves correctly through `TallyData.
+    resolve_top_level_group` (stops immediately, since `""` is never a key
+    in `groups`) without falsely matching any of `PROFIT_AND_LOSS_
+    PARENT_GROUPS`, so a reserved ledger like this stays correctly
+    classified as a permanent/balance-sheet ledger, not excluded as P&L.
   - Real exports commonly arrive as **two separate files** -- one with only
     `<GROUP>`/`<LEDGER>` masters, another with only `<VOUCHER>` entries --
     rather than one combined file, and both can carry the same
@@ -273,12 +294,13 @@ Implementation, so a future session can find the pieces:
     combined entry point. `parse_tally_xml_data` (single file) is
     unchanged/backward compatible -- still requires the file to be
     self-contained.
-  Unit tests: `tests/test_tally_xml_parser.py` (60 tests: sign-convention
+  Unit tests: `tests/test_tally_xml_parser.py` (65 tests: sign-convention
   math, P&L filtering, group-hierarchy resolution, encoding normalization
   — including both the entity-reference and raw-literal illegal-character
   cases — split-file merging, the `TallyXmlParseError` subclass hierarchy
-  (`ErrorSubclassTests`), every rejection path, `TallyData` field/method
-  coverage) plus `tests/test_parse_error_classification.py` (10 tests) for
+  (`ErrorSubclassTests`), the empty-`<PARENT/>` fix (`EmptyParentLedgerTests`),
+  every rejection path, `TallyData` field/method coverage) plus
+  `tests/test_parse_error_classification.py` (10 tests) for
   `parse_error_classification.py`. Real-world-scale regression check
   (standalone, not part of `unittest discover` -- see below):
   `tests/verify_large_split_utf16_files.py`

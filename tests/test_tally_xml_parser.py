@@ -153,6 +153,77 @@ class ProfitAndLossFilteringTests(unittest.TestCase):
             parse_tally_xml(xml)
 
 
+class EmptyParentLedgerTests(unittest.TestCase):
+    """Covers a real client bug (2026-08-09): a ledger whose <PARENT> is
+    present but empty/self-closing (<PARENT/>) was wrongly rejected the
+    same way as the tag being entirely absent -- "missing required
+    <PARENT> element". Confirmed real example: Tally's own reserved
+    "Profit & Loss A/c" ledger genuinely has no parent group at all, and a
+    real export represents that with an empty <PARENT/>, not by omitting
+    the tag. See _required_element_optional_text in tally_xml_parser.py."""
+
+    def test_ledger_with_self_closing_parent_tag_parses_successfully(self):
+        # The exact real-world shape: <PARENT/>, self-closing.
+        xml = ENVELOPE_OPEN + b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Profit &amp; Loss A/c" ACTION="Create">
+            <PARENT/>
+            <OPENINGBALANCE>-125000.00</OPENINGBALANCE>
+          </LEDGER>
+        </TALLYMESSAGE>
+        """ + ENVELOPE_CLOSE
+        data = parse_tally_xml_data(xml)
+        self.assertIn("Profit & Loss A/c", data.ledgers)
+        self.assertEqual(data.ledgers["Profit & Loss A/c"].parent, "")
+        self.assertEqual(data.ledgers["Profit & Loss A/c"].opening_balance, Decimal("-125000.00"))
+
+    def test_ledger_with_empty_open_close_parent_tag_also_parses(self):
+        # <PARENT></PARENT> (not self-closing) -- ElementTree treats this
+        # identically to <PARENT/>, but worth covering explicitly rather
+        # than assuming that holds.
+        xml = build_xml(ledger_xml("Profit &amp; Loss A/c", "", "-125000.00"))
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.ledgers["Profit & Loss A/c"].parent, "")
+
+    def test_ledger_with_parent_element_completely_absent_still_raises(self):
+        # Distinct from the empty-tag case above: the ELEMENT itself
+        # missing entirely is still a structural problem, not a legitimate
+        # "no parent group" state -- see _required_element_optional_text's
+        # docstring for why these are treated differently.
+        xml = ENVELOPE_OPEN + b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Some Ledger" ACTION="Create">
+            <OPENINGBALANCE>1000.00</OPENINGBALANCE>
+          </LEDGER>
+        </TALLYMESSAGE>
+        """ + ENVELOPE_CLOSE
+        with self.assertRaises(TallyXmlParseError) as ctx:
+            parse_tally_xml_data(xml)
+        self.assertIn("missing required <PARENT>", str(ctx.exception))
+
+    def test_ledger_with_empty_parent_not_misclassified_as_profit_and_loss(self):
+        # A ledger with no parent group at all must NOT be silently
+        # excluded from parse_tally_xml's permanent (balance-sheet) trial
+        # balance -- resolve_top_level_group("") must not accidentally
+        # match anything in PROFIT_AND_LOSS_PARENT_GROUPS.
+        xml = build_xml(ledger_xml("Profit &amp; Loss A/c", "", "-125000.00"))
+        tb = parse_tally_xml(xml)
+        self.assertEqual(len(tb.ledgers), 1)
+        self.assertEqual(tb.ledgers[0].name, "Profit & Loss A/c")
+
+    def test_voucher_can_reference_ledger_with_empty_parent(self):
+        # The reserved ledger isn't just a static balance -- vouchers can
+        # legitimately touch it too (e.g. year-end transfers), so closing
+        # balance computation must work the same as for any other ledger.
+        xml = build_xml(
+            ledger_xml("Profit &amp; Loss A/c", "", "-125000.00"),
+            ledger_xml("Reserves and Surplus", "Reserves and Surplus", "0.00"),
+            voucher_xml("Journal", "JV-0001", [("Profit &amp; Loss A/c", True, "-50000.00"), ("Reserves and Surplus", False, "50000.00")]),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.closing_balance("Profit & Loss A/c"), Decimal("-75000.00"))
+
+
 class TallyDataStructureTests(unittest.TestCase):
     def test_voucher_fields_preserved(self):
         xml = build_xml(

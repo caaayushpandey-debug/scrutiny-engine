@@ -124,12 +124,15 @@ without parsing error message text:
   isn't <ENVELOPE>, or there's no <LEDGER> master anywhere in it (or, for
   parse_tally_xml_data_multi, in ANY of the supplied files).
 - TallyXmlParseError (the base class, raised directly) -- everything else:
-  a <LEDGER>/<GROUP> with no NAME attribute or a duplicate NAME, a missing
-  PARENT/OPENINGBALANCE or an unparseable OPENINGBALANCE, a <VOUCHER> with
-  fewer than 2 ledger entries, a ledger entry missing LEDGERNAME/
-  ISDEEMEDPOSITIVE/AMOUNT or with an ISDEEMEDPOSITIVE that isn't exactly
-  "Yes"/"No", an AMOUNT that can't be parsed as a decimal or whose sign is
-  inconsistent with ISDEEMEDPOSITIVE, a voucher whose legs don't sum to
+  a <LEDGER>/<GROUP> with no NAME attribute or a duplicate NAME, a <LEDGER>
+  with no <PARENT> element AT ALL (an EMPTY <PARENT/> is legitimate --
+  Tally's own reserved ledgers, e.g. "Profit & Loss A/c", have no parent
+  group at all -- see _required_element_optional_text) or a missing/
+  unparseable OPENINGBALANCE, a <VOUCHER> with fewer than 2 ledger entries,
+  a ledger entry missing LEDGERNAME/ISDEEMEDPOSITIVE/AMOUNT or with an
+  ISDEEMEDPOSITIVE that isn't exactly "Yes"/"No", an AMOUNT that can't be
+  parsed as a decimal or whose sign is inconsistent with ISDEEMEDPOSITIVE,
+  a voucher whose legs don't sum to
   zero, a leg referencing a ledger name with no matching <LEDGER> master
   (for parse_tally_xml_data_multi, only once no fragment anywhere in the
   upload has a matching master), duplicate ledger/group names across
@@ -406,6 +409,36 @@ def _required_text(element: ET.Element, tag: str, context: str) -> str:
     return child.text.strip()
 
 
+def _required_element_optional_text(element: ET.Element, tag: str, context: str) -> str:
+    """Like _required_text, but an EMPTY or self-closing element (e.g.
+    <PARENT/>) is a legitimate value, not an error -- returns "" in that
+    case rather than raising. The element itself must still be present;
+    only a completely ABSENT element still raises.
+
+    Confirmed against real client data (2026-08-09): Tally's own reserved
+    top-level ledgers -- "Profit & Loss A/c" is the confirmed real example --
+    genuinely have no parent group at all, and a real export represents
+    that as an empty <PARENT/> tag, not by omitting the tag. Requiring
+    non-empty text (what _required_text does) rejected this as "missing
+    required <PARENT> element", which was wrong: the field wasn't missing,
+    it was legitimately empty.
+
+    Why the element itself is still required (judgment call, not
+    independently verified against a live Tally installation): every real
+    Tally export seen so far -- including this exact one -- always emits
+    every known field's tag, populated or not, rather than ever omitting a
+    tag outright (the same pattern already seen with <STATKEY> always being
+    present even when its content isn't consumed by anything downstream).
+    A LEDGER with no <PARENT> tag AT ALL would be a different, more
+    structurally surprising shape than anything observed in real data so
+    far, so that case still fails loud rather than silently guessing "".
+    """
+    child = element.find(tag)
+    if child is None:
+        raise TallyXmlParseError(f"{context}: missing required <{tag}> element.")
+    return (child.text or "").strip()
+
+
 def _parse_decimal(raw: str, context: str) -> Decimal:
     try:
         return Decimal(raw)
@@ -435,7 +468,13 @@ def _extract_ledger_masters_raw(root: ET.Element) -> Dict[str, TallyLedgerMaster
         if name in masters:
             raise TallyXmlParseError(f"Duplicate ledger master '{name}' -- ambiguous which opening balance is authoritative.")
 
-        parent = _required_text(ledger_el, "PARENT", f"Ledger '{name}'")
+        # PARENT may legitimately be empty (<PARENT/>) -- see
+        # _required_element_optional_text's docstring for the confirmed
+        # real-world case (Tally's reserved "Profit & Loss A/c" ledger has
+        # no parent group at all). OPENINGBALANCE has no such "legitimately
+        # blank" case -- an empty opening balance isn't a valid number, so
+        # it stays on the strict _required_text path.
+        parent = _required_element_optional_text(ledger_el, "PARENT", f"Ledger '{name}'")
         opening_raw = _required_text(ledger_el, "OPENINGBALANCE", f"Ledger '{name}'")
         opening_balance = _parse_decimal(opening_raw, f"Ledger '{name}' OPENINGBALANCE")
 
