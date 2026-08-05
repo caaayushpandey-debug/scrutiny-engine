@@ -2,7 +2,11 @@ import unittest
 from decimal import Decimal
 
 from tally_xml_parser import (
+    TallyXmlEncodingError,
+    TallyXmlMalformedError,
+    TallyXmlNotATallyExportError,
     TallyXmlParseError,
+    TallyXmlTruncatedError,
     _normalize_xml_encoding,
     _strip_invalid_numeric_entities,
     _strip_raw_illegal_control_chars,
@@ -627,6 +631,79 @@ class RejectionTests(unittest.TestCase):
         with self.assertRaises(TallyXmlParseError) as ctx:
             parse_tally_xml(xml)
         self.assertIn("ISDEEMEDPOSITIVE", str(ctx.exception))
+
+
+class ErrorSubclassTests(unittest.TestCase):
+    """Covers the TallyXmlParseError subclass hierarchy (added 2026-08-08) --
+    api.py's error classification (see parse_error_classification.py)
+    depends on the SPECIFIC subclass raised, not just on TallyXmlParseError
+    generally, to turn a failure into a plain-language, user-facing message.
+    A test here failing means a failure that should be specifically
+    recognized (e.g. a truncated file) would silently fall back to the
+    generic "something's wrong with this file's data" bucket instead."""
+
+    def test_truncated_file_raises_truncated_error_specifically(self):
+        # Confirmed against a real client file (2026-08-08): a large export
+        # cut off mid-transfer raises exactly this shape -- content that
+        # runs out before the XML structure is complete, not a malformed
+        # token. Deep truncation (mid-way through a large document, not at
+        # the very start) to match the real reported shape.
+        xml = build_xml(
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            ledger_xml("Sales Account", "Sales Accounts", "0.00"),
+        )
+        truncated = xml[: len(xml) - 40]  # cut off before ENVELOPE_CLOSE
+        with self.assertRaises(TallyXmlTruncatedError):
+            parse_tally_xml_data(truncated)
+
+    def test_empty_file_also_raises_truncated_error(self):
+        # Same expat error code (XML_ERROR_NO_ELEMENTS) as a mid-document
+        # cut-off -- both mean "never reached a complete document".
+        with self.assertRaises(TallyXmlTruncatedError):
+            parse_tally_xml_data(b"")
+
+    def test_genuinely_malformed_xml_raises_malformed_error_not_truncated(self):
+        # An actual bad token, not a premature end-of-input -- must NOT be
+        # classified as truncation.
+        with self.assertRaises(TallyXmlMalformedError) as ctx:
+            parse_tally_xml_data(b"<ENVELOPE><BODY>&undefined_entity;</BODY></ENVELOPE>")
+        self.assertNotIsInstance(ctx.exception, TallyXmlTruncatedError)
+
+    def test_wrong_root_element_raises_not_a_tally_export_error(self):
+        with self.assertRaises(TallyXmlNotATallyExportError):
+            parse_tally_xml_data(b'<?xml version="1.0"?><NOTENVELOPE></NOTENVELOPE>')
+
+    def test_no_ledgers_raises_not_a_tally_export_error(self):
+        xml = ENVELOPE_OPEN + ENVELOPE_CLOSE
+        with self.assertRaises(TallyXmlNotATallyExportError):
+            parse_tally_xml_data(xml)
+
+    def test_no_ledgers_across_split_files_raises_not_a_tally_export_error(self):
+        with self.assertRaises(TallyXmlNotATallyExportError):
+            parse_tally_xml_data_multi([ENVELOPE_OPEN + ENVELOPE_CLOSE])
+
+    def test_undecodable_bytes_raise_encoding_error_specifically(self):
+        garbage = b"\x80\x81\x82\x83not valid utf-8 or utf-16"
+        with self.assertRaises(TallyXmlEncodingError):
+            parse_tally_xml_data(garbage)
+
+    def test_duplicate_ledger_raises_base_class_not_a_named_subclass(self):
+        # A recognized DATA problem (not structural/encoding) -- deliberately
+        # stays the base TallyXmlParseError, which api.py's classifier maps
+        # to the generic "file_data_issue" category, not one of the more
+        # specific ones above.
+        xml = build_xml(
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            ledger_xml("HDFC Bank", "Bank Accounts", "2000.00"),
+        )
+        try:
+            parse_tally_xml_data(xml)
+            self.fail("expected TallyXmlParseError")
+        except TallyXmlParseError as e:
+            self.assertNotIsInstance(e, TallyXmlTruncatedError)
+            self.assertNotIsInstance(e, TallyXmlMalformedError)
+            self.assertNotIsInstance(e, TallyXmlNotATallyExportError)
+            self.assertNotIsInstance(e, TallyXmlEncodingError)
 
 
 if __name__ == "__main__":

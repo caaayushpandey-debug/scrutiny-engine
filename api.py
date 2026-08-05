@@ -42,6 +42,18 @@ Endpoints:
   registry-driven dispatcher). Takes the same TallyData shape
   /parse-tally-xml returns, so the two chain directly: upload Tally XML to
   /parse-tally-xml, feed its response straight into /run-suspense-check.
+
+File-parsing error responses (added 2026-08-08): all three upload endpoints
+above (/parse-trial-balance, /parse-tally-xml, /parse-tally-xml-multi) return
+a structured, plain-language error body on a parse failure -- see
+parse_error_classification.classify_parse_error -- instead of a raw
+exception message string. Every failure response's `detail` is a JSON object:
+{"category": "...", "is_file_problem": bool, "message": "...",
+ "suggested_fix": "...", "technical_detail": "..."}. Status code is 422 for
+every recognized category (a problem WITH THE FILE) and 500 only for
+"unknown" (a problem with THIS PROJECT'S code, not the file) -- see
+tally_xml_parser.py's TallyXmlParseError subclass hierarchy for how a
+failure gets sorted into a category in the first place.
 """
 from __future__ import annotations
 
@@ -54,10 +66,11 @@ from pydantic import BaseModel, Field
 
 from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check
 from checks.suspense_account_scrutiny import run_check as run_suspense_account_scrutiny
+from parse_error_classification import classify_parse_error
 from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
-from tally_xml_parser import TallyXmlParseError, parse_tally_xml_data, parse_tally_xml_data_multi
-from trial_balance_csv_parser import TrialBalanceParseError, parse_trial_balance_csv
+from tally_xml_parser import parse_tally_xml_data, parse_tally_xml_data_multi
+from trial_balance_csv_parser import parse_trial_balance_csv
 
 app = FastAPI(
     title="AI Scrutiny Engine API",
@@ -147,12 +160,19 @@ async def parse_trial_balance(file: UploadFile = File(...)) -> dict:
     try:
         text = raw.decode("utf-8-sig")  # -sig gracefully strips a BOM if present
     except UnicodeDecodeError as e:
-        raise HTTPException(status_code=422, detail=f"Could not decode '{file.filename}' as UTF-8 text: {e}")
+        classified = classify_parse_error(e)
+        raise HTTPException(status_code=classified.status_code, detail=classified.to_dict())
 
     try:
         trial_balance = parse_trial_balance_csv(text)
-    except TrialBalanceParseError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        # Broad except is deliberate here, not just TrialBalanceParseError --
+        # see classify_parse_error's docstring: anything NOT one of this
+        # project's own recognized parse-error types still gets classified
+        # (into the "unknown" catch-all) rather than leaking an unhandled
+        # 500 traceback to the frontend.
+        classified = classify_parse_error(e)
+        raise HTTPException(status_code=classified.status_code, detail=classified.to_dict())
 
     return {
         "ledgers": [
@@ -258,8 +278,14 @@ async def parse_tally_xml(file: UploadFile = File(...)) -> dict:
     raw = await file.read()
     try:
         tally_data = parse_tally_xml_data(raw)
-    except TallyXmlParseError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        # Broad except is deliberate here, not just TallyXmlParseError -- see
+        # classify_parse_error's docstring: anything NOT one of this
+        # project's own recognized parse-error types still gets classified
+        # (into the "unknown" catch-all) rather than leaking an unhandled
+        # 500 traceback to the frontend.
+        classified = classify_parse_error(e)
+        raise HTTPException(status_code=classified.status_code, detail=classified.to_dict())
 
     return _tally_data_to_response(tally_data)
 
@@ -281,7 +307,9 @@ async def parse_tally_xml_multi(files: List[UploadFile] = File(...)) -> dict:
     raw_files = [await f.read() for f in files]
     try:
         tally_data = parse_tally_xml_data_multi(raw_files)
-    except TallyXmlParseError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        # See /parse-tally-xml's identical comment above.
+        classified = classify_parse_error(e)
+        raise HTTPException(status_code=classified.status_code, detail=classified.to_dict())
 
     return _tally_data_to_response(tally_data)

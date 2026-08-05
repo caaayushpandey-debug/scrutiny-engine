@@ -104,33 +104,44 @@ directly rather than going through parse_tally_xml, is the check actually
 validated against data-synthesizer's Tally XML samples -- see that check's
 docstring and tests/verify_suspense_account_scrutiny_against_data_synthesizer.py.
 
-Failure modes (raises TallyXmlParseError, never silently misparses)
------------------------------------------------------------------------
-- Not well-formed XML, or the root element isn't <ENVELOPE>.
-- No <LEDGER> masters found at all.
-- A <LEDGER> with no NAME attribute, a missing PARENT/OPENINGBALANCE, an
-  unparseable OPENINGBALANCE, or a NAME that duplicates an earlier ledger.
-- A <GROUP> with no NAME attribute, or a NAME that duplicates an earlier
-  group (a missing PARENT is tolerated, unlike LEDGER -- see
-  _extract_group_masters).
-- A <VOUCHER> with fewer than 2 ledger entries (not valid double-entry), a
-  ledger entry missing LEDGERNAME/ISDEEMEDPOSITIVE/AMOUNT, an
-  ISDEEMEDPOSITIVE value that isn't exactly "Yes"/"No", an AMOUNT that can't
-  be parsed as a decimal or whose sign is inconsistent with ISDEEMEDPOSITIVE,
-  a voucher whose legs don't sum to zero, or a leg referencing a ledger name
-  with no matching <LEDGER> master (for parse_tally_xml_data_multi, this
-  last check is only raised once no fragment anywhere in the upload has a
-  matching master -- see "Split masters/transactions exports").
-- (parse_tally_xml only) after excluding P&L-group ledgers, nothing
-  permanent is left to check.
-- (parse_tally_xml_data_multi only) no <LEDGER> masters found in ANY of the
-  supplied files, or the same ledger/group name defined in more than one of
-  them (ambiguous which is authoritative).
-- Cannot decode a file as UTF-8 or UTF-16 (checked via byte-order mark).
+Failure modes (raises a TallyXmlParseError subclass, never silently misparses)
+-------------------------------------------------------------------------------
+TallyXmlParseError itself has a small subclass hierarchy (added 2026-08-08)
+so callers -- specifically api.py's error classification, which turns each
+into a plain-language, user-facing message -- can tell a handful of common,
+specifically-named problems apart from each other and from everything else,
+without parsing error message text:
+- TallyXmlEncodingError -- cannot decode a file as UTF-8 or UTF-16 (checked
+  via byte-order mark) at all; fails before any XML parsing is attempted.
+- TallyXmlTruncatedError -- the file's XML structure never reaches a
+  complete state (expat ran out of input mid-document, or the file is
+  empty) -- distinguished from other malformed XML via expat's own error
+  code, not by guessing from the message text. Confirmed against a real
+  client file (2026-08-08) that was genuinely cut off mid-transfer.
+- TallyXmlMalformedError -- not well-formed XML for any other reason (a bad
+  token, mismatched tags, junk after the root element, etc).
+- TallyXmlNotATallyExportError -- well-formed XML, but the root element
+  isn't <ENVELOPE>, or there's no <LEDGER> master anywhere in it (or, for
+  parse_tally_xml_data_multi, in ANY of the supplied files).
+- TallyXmlParseError (the base class, raised directly) -- everything else:
+  a <LEDGER>/<GROUP> with no NAME attribute or a duplicate NAME, a missing
+  PARENT/OPENINGBALANCE or an unparseable OPENINGBALANCE, a <VOUCHER> with
+  fewer than 2 ledger entries, a ledger entry missing LEDGERNAME/
+  ISDEEMEDPOSITIVE/AMOUNT or with an ISDEEMEDPOSITIVE that isn't exactly
+  "Yes"/"No", an AMOUNT that can't be parsed as a decimal or whose sign is
+  inconsistent with ISDEEMEDPOSITIVE, a voucher whose legs don't sum to
+  zero, a leg referencing a ledger name with no matching <LEDGER> master
+  (for parse_tally_xml_data_multi, only once no fragment anywhere in the
+  upload has a matching master), duplicate ledger/group names across
+  multiple files in parse_tally_xml_data_multi, or (parse_tally_xml only)
+  nothing permanent left to check after excluding P&L-group ledgers. These
+  are all recognized problems with the FILE's data, just not ones specific
+  enough to name their own subclass for.
 """
 import codecs
 import re
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -150,7 +161,55 @@ PROFIT_AND_LOSS_PARENT_GROUPS = {
 
 
 class TallyXmlParseError(ValueError):
-    """Raised when a file cannot be confidently parsed as this Tally XML export shape."""
+    """Raised when a file cannot be confidently parsed as this Tally XML export
+    shape. This is also the category for a recognized problem with the
+    FILE's data/content that doesn't fit one of the more specific subclasses
+    below (e.g. a duplicate ledger, a voucher whose legs don't sum to zero,
+    ISDEEMEDPOSITIVE/AMOUNT sign mismatch) -- callers (see api.py's error
+    classification) treat "TallyXmlParseError raised directly, not as one of
+    its named subclasses" as its own "something about this file's DATA looks
+    wrong" bucket, distinct from the structural problems the subclasses
+    below name specifically. All of these still mean "the FILE has a
+    problem", never "our code has a bug" -- see the subclass docstrings
+    below for what to raise instead when the problem is more specific, and
+    api.py for the one place that turns each of these into a plain-language,
+    user-facing message.
+    """
+
+
+class TallyXmlEncodingError(TallyXmlParseError):
+    """The file's bytes could not be decoded as UTF-8 or UTF-16 at all --
+    raised by _normalize_xml_encoding when every encoding this module knows
+    how to sniff (via BOM, or a bare UTF-8 fallback) fails to decode the raw
+    bytes. Distinct from TallyXmlMalformedError: this fails before ANY XML
+    parsing is even attempted."""
+
+
+class TallyXmlTruncatedError(TallyXmlParseError):
+    """The file's XML structure never reaches a complete, well-formed state
+    -- expat ran out of input (end-of-file) while still expecting more
+    content, rather than encountering an actual malformed token partway
+    through. Confirmed against a real client file (2026-08-08): a large
+    Transactions.xml that was cut off mid-transfer/mid-export raised exactly
+    this ("no element found" at a line/column deep into the file, not at the
+    start) -- see _parse_envelope_root for how this is detected (expat's own
+    error code, xml.parsers.expat.errors.codes["no element found"], not
+    string-matching the message text)."""
+
+
+class TallyXmlMalformedError(TallyXmlParseError):
+    """The file is not well-formed XML, for a reason OTHER than running out
+    of input (see TallyXmlTruncatedError for that specific case) -- e.g. a
+    genuinely invalid token, mismatched tags, or content after the root
+    element closes. Raised by _parse_envelope_root."""
+
+
+class TallyXmlNotATallyExportError(TallyXmlParseError):
+    """The file decodes and parses as well-formed XML, but doesn't have the
+    structure a Tally export is expected to have -- either the root element
+    isn't <ENVELOPE>, or there isn't a single <LEDGER> master anywhere in
+    it. Raised by _parse_envelope_root and _extract_ledger_masters /
+    merge_tally_xml_fragments respectively."""
 
 
 # Valid XML 1.0 character ranges (spec section 2.2) -- everything else is
@@ -273,7 +332,7 @@ def _normalize_xml_encoding(xml_bytes: bytes) -> bytes:
         try:
             text = xml_bytes.decode("utf-8")
         except UnicodeDecodeError as e:
-            raise TallyXmlParseError(
+            raise TallyXmlEncodingError(
                 f"Could not decode file as UTF-8 or UTF-16 (checked for a byte-order mark of either): {e}"
             ) from e
 
@@ -281,6 +340,34 @@ def _normalize_xml_encoding(xml_bytes: bytes) -> bytes:
     text = _strip_raw_illegal_control_chars(text)
     normalized = text.encode("utf-8")
     return _XML_DECLARATION_RE.sub(b"", normalized, count=1)
+
+
+# expat error codes that specifically mean "ran out of input before the
+# document's XML structure was complete" -- i.e. truncation (or a genuinely
+# empty file, which hits the same code). Determined empirically, not just
+# from the one real reported case: cutting a realistic multi-KB document at
+# 200 random points and observing which codes actually came back showed
+# BOTH "no element found" (parser reached EOF with no/incomplete root) AND
+# "unclosed token" (EOF while a start tag/attribute was still open) --
+# roughly 3 unclosed-token results for every no-element-found one, so
+# matching only the exact code from the one real report seen so far
+# (XML_ERROR_NO_ELEMENTS) would have missed most other truncation points.
+# XML_ERROR_UNCLOSED_CDATA_SECTION and XML_ERROR_PARTIAL_CHAR are the same
+# category of problem (EOF mid-token) even though neither came up in that
+# survey -- Tally XML doesn't appear to use CDATA sections, and
+# _normalize_xml_encoding always re-encodes to complete, valid UTF-8 before
+# handing bytes to expat, so a partial multi-byte character shouldn't
+# realistically reach expat either -- included for completeness/robustness,
+# not because either has been observed.
+_TRUNCATION_EXPAT_CODES = frozenset(
+    xml.parsers.expat.errors.codes[name]
+    for name in (
+        "no element found",
+        "unclosed token",
+        "unclosed CDATA section",
+        "partial character",
+    )
+)
 
 
 def _parse_envelope_root(xml_bytes: bytes) -> ET.Element:
@@ -293,10 +380,21 @@ def _parse_envelope_root(xml_bytes: bytes) -> ET.Element:
     try:
         root = ET.fromstring(normalized)
     except ET.ParseError as e:
-        raise TallyXmlParseError(f"Not well-formed XML: {e}") from e
+        # expat's own error code -- not string-matching e's message text --
+        # distinguishes "ran out of input before the document was complete"
+        # (see _TRUNCATION_EXPAT_CODES: both a truncated/cut-off file and a
+        # genuinely empty one hit one of these) from every other kind of
+        # malformed XML (a genuinely bad token mid-document, a mismatched
+        # tag, junk after the root closes, etc). Confirmed against a real
+        # client file (2026-08-08): a large Transactions.xml cut off
+        # mid-transfer raised exactly "no element found", at a line/column
+        # deep into the file, not at the start.
+        if e.code in _TRUNCATION_EXPAT_CODES:
+            raise TallyXmlTruncatedError(f"File appears incomplete (ran out of content before the XML structure was complete): {e}") from e
+        raise TallyXmlMalformedError(f"Not well-formed XML: {e}") from e
 
     if root.tag != "ENVELOPE":
-        raise TallyXmlParseError(f"Expected root element <ENVELOPE>, found <{root.tag}> -- doesn't look like a Tally export.")
+        raise TallyXmlNotATallyExportError(f"Expected root element <ENVELOPE>, found <{root.tag}> -- doesn't look like a Tally export.")
 
     return root
 
@@ -349,7 +447,7 @@ def _extract_ledger_masters_raw(root: ET.Element) -> Dict[str, TallyLedgerMaster
 def _extract_ledger_masters(root: ET.Element) -> Dict[str, TallyLedgerMaster]:
     masters = _extract_ledger_masters_raw(root)
     if not masters:
-        raise TallyXmlParseError("No <LEDGER> master elements found -- doesn't look like a Tally export.")
+        raise TallyXmlNotATallyExportError("No <LEDGER> master elements found -- doesn't look like a Tally export.")
     return masters
 
 
@@ -530,7 +628,7 @@ def merge_tally_xml_fragments(fragments: List[TallyData]) -> TallyData:
         merged_vouchers.extend(fragment.vouchers)
 
     if not merged_ledgers:
-        raise TallyXmlParseError(
+        raise TallyXmlNotATallyExportError(
             "No <LEDGER> master elements found in any of the uploaded files -- doesn't look like a Tally export."
         )
 

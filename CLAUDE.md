@@ -182,6 +182,15 @@ Implementation, so a future session can find the pieces:
   `schemas/trial_balance.py`'s strict `TrialBalance.from_csv` (which stays
   as the canonical, exact-format parser other checks can rely on). See its
   own docstring for exactly what variations are tolerated.
+- `parse_error_classification.py` (added 2026-08-08) — turns a raw parse
+  exception (from `tally_xml_parser.py` or `trial_balance_csv_parser.py`)
+  into a plain-language, user-facing category + message + suggested fix,
+  for `api.py`'s file-upload endpoints to return instead of a raw error
+  string. Deliberately its own stdlib-only module, not inline in `api.py`,
+  so it stays covered by the fast `unittest discover` suite even though
+  `api.py` itself needs the venv (FastAPI) to even import — see "File-
+  parsing error classification" under the `api.py` bullet below for the
+  full category list and how each failure gets sorted into one.
 - `tally_xml_parser.py` (added 2026-08-02) — Tally XML → `TallyData` /
   `TrialBalance` parser, matching the schema `data-synthesizer`'s Tally XML
   generator produces (see that project's
@@ -264,12 +273,15 @@ Implementation, so a future session can find the pieces:
     combined entry point. `parse_tally_xml_data` (single file) is
     unchanged/backward compatible -- still requires the file to be
     self-contained.
-  Unit tests: `tests/test_tally_xml_parser.py` (52 tests: sign-convention
+  Unit tests: `tests/test_tally_xml_parser.py` (60 tests: sign-convention
   math, P&L filtering, group-hierarchy resolution, encoding normalization
   — including both the entity-reference and raw-literal illegal-character
-  cases — split-file merging, every rejection path, `TallyData` field/method
-  coverage). Real-world-scale regression check (standalone, not part of
-  `unittest discover` -- see below): `tests/verify_large_split_utf16_files.py`
+  cases — split-file merging, the `TallyXmlParseError` subclass hierarchy
+  (`ErrorSubclassTests`), every rejection path, `TallyData` field/method
+  coverage) plus `tests/test_parse_error_classification.py` (10 tests) for
+  `parse_error_classification.py`. Real-world-scale regression check
+  (standalone, not part of `unittest discover` -- see below):
+  `tests/verify_large_split_utf16_files.py`
   generates a ~9MB UTF-16 masters file + ~61MB UTF-16 transactions file on
   the fly (matching a real reported case exactly) with GST-specific noise
   tags and invalid numeric entities scattered throughout, and asserts both
@@ -312,9 +324,9 @@ Implementation, so a future session can find the pieces:
     "legs": [{"ledger_name", "is_debit", "amount"}]}]}` (amounts as strings,
     same Decimal-precision reasoning as `/parse-trial-balance`). Parsing
     logic lives in `tally_xml_parser.py`'s `parse_tally_xml_data` (see
-    "Structure" above) — 422 with the parser's own error message on
-    malformed input (not well-formed XML, wrong root element, sign-
-    convention violations, unbalanced vouchers, etc). Not yet wired to a
+    "Structure" above) — 422 with a classified, plain-language error on
+    malformed input (see "File-parsing error classification" below; not the
+    parser's raw exception message string). Not yet wired to a
     check endpoint the way `/parse-trial-balance` feeds `/run-checks` --
     `checks/suspense_account_scrutiny.py` (the check actually validated
     against this data) has no HTTP endpoint yet, only a CLI entry point.
@@ -341,6 +353,56 @@ Implementation, so a future session can find the pieces:
     confirmed empirically too, with a real HTTP POST of two real-world-scale
     UTF-16 files (~9MB + ~61MB, ~70MB total request) to a running server —
     200 OK in under 2 seconds, not rejected.
+  - **File-parsing error classification** (added 2026-08-08, prompted by a
+    real user seeing a raw error like `"Not well-formed XML: no element
+    found: line 563384, column 7"` when a real Transactions.xml turned out
+    to be cut off mid-transfer -- meaningless to a non-technical user).
+    Every failure from `/parse-trial-balance`, `/parse-tally-xml`, and
+    `/parse-tally-xml-multi` now returns a structured JSON `detail` instead
+    of a raw exception string: `{"category", "is_file_problem", "message",
+    "suggested_fix", "technical_detail"}`. Classification logic lives in the
+    new `parse_error_classification.py` (stdlib-only, deliberately NOT
+    inside `api.py` -- see that module's docstring for why: it needs to stay
+    testable via the fast `unittest discover` suite, which can't import
+    `api.py` itself since that requires FastAPI, this project's one
+    dependency exception). `tally_xml_parser.py`'s `TallyXmlParseError` grew
+    a small subclass hierarchy (`TallyXmlTruncatedError`,
+    `TallyXmlEncodingError`, `TallyXmlMalformedError`,
+    `TallyXmlNotATallyExportError`, plus the base class itself for anything
+    else) so classification is a plain `isinstance` check, not string-
+    matching error messages. Categories: `file_truncated` (the file's XML
+    structure never reaches a complete state -- detected via expat's own
+    error CODE, not message text; broadened empirically past just the one
+    reported code, "no element found" -- truncating a realistic document at
+    200 random points showed "unclosed token" firing roughly 3x as often,
+    so both plus `unclosed CDATA section`/`partial character` for
+    completeness are all treated as truncation), `unsupported_encoding`
+    (can't decode as UTF-8/UTF-16 at all), `not_a_tally_export` (well-formed
+    XML but wrong root element or no `<LEDGER>` masters anywhere),
+    `not_valid_xml` (malformed XML for any other reason), `file_data_issue`
+    (the base `TallyXmlParseError`/`TrialBalanceParseError` case -- a
+    recognized problem with the file's DATA that doesn't need its own named
+    category, e.g. a duplicate ledger or unbalanced voucher; the existing
+    exception message is reused as both `message` and `technical_detail`
+    since it's already reasonably clear), and `unknown` (a genuine
+    catch-all for an exception that ISN'T one of this project's own
+    recognized parse-error types at all -- `is_file_problem: False` and
+    HTTP 500, not 422, since this means a bug in this project's own code,
+    not a problem with the user's file). Every category except `unknown`
+    returns 422. Unit tests: `tests/test_parse_error_classification.py` (10
+    tests covering every category + the response-shape contract) and
+    `tests/test_tally_xml_parser.py`'s `ErrorSubclassTests` (8 tests
+    confirming the right SPECIFIC subclass gets raised, not just the base
+    class). Verified against a real-shaped reproduction (not just unit
+    tests): generated a ~25MB synthetic Transactions.xml, cut it off ~65%
+    through right after a `</TALLYMESSAGE>` boundary (reproducing the exact
+    real error signature -- "no element found" at a deep line number, not
+    at the start), uploaded it to a running server via
+    `/parse-tally-xml-multi` and got back the friendly `file_truncated`
+    JSON response; uploaded the SAME file un-truncated and got a normal 200
+    OK with the correct ledger/voucher counts, confirming no regression for
+    valid files. Also spot-checked `not_valid_xml`, `not_a_tally_export`,
+    and `unsupported_encoding` live against the running server.
   - `POST /run-suspense-check` (added 2026-08-02) — wraps
     `checks/suspense_account_scrutiny.py` specifically (same one-check-per-
     endpoint approach as `/run-checks`, not a registry-driven dispatcher).
