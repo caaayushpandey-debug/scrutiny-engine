@@ -127,12 +127,15 @@ without parsing error message text:
   a <LEDGER>/<GROUP> with no NAME attribute or a duplicate NAME, a <LEDGER>
   with no <PARENT> element AT ALL (an EMPTY <PARENT/> is legitimate --
   Tally's own reserved ledgers, e.g. "Profit & Loss A/c", have no parent
-  group at all -- see _required_element_optional_text) or a missing/
-  unparseable OPENINGBALANCE, a <VOUCHER> with fewer than 2 ledger entries,
-  a ledger entry missing LEDGERNAME/ISDEEMEDPOSITIVE/AMOUNT or with an
-  ISDEEMEDPOSITIVE that isn't exactly "Yes"/"No", an AMOUNT that can't be
-  parsed as a decimal or whose sign is inconsistent with ISDEEMEDPOSITIVE,
-  a voucher whose legs don't sum to
+  group at all -- see _required_element_optional_text), a present-but-
+  unparseable OPENINGBALANCE (an ABSENT <OPENINGBALANCE> is legitimate --
+  the same "Profit & Loss A/c" ledger also omits it entirely for a
+  genuinely zero opening balance -- see _optional_decimal_element, which
+  defaults to 0.00 rather than erroring), a <VOUCHER> with fewer than 2
+  ledger entries, a ledger entry missing LEDGERNAME/ISDEEMEDPOSITIVE/AMOUNT
+  or with an ISDEEMEDPOSITIVE that isn't exactly "Yes"/"No", an AMOUNT that
+  can't be parsed as a decimal or whose sign is inconsistent with
+  ISDEEMEDPOSITIVE, a voucher whose legs don't sum to
   zero, a leg referencing a ledger name with no matching <LEDGER> master
   (for parse_tally_xml_data_multi, only once no fragment anywhere in the
   upload has a matching master), duplicate ledger/group names across
@@ -424,14 +427,22 @@ def _required_element_optional_text(element: ET.Element, tag: str, context: str)
     it was legitimately empty.
 
     Why the element itself is still required (judgment call, not
-    independently verified against a live Tally installation): every real
-    Tally export seen so far -- including this exact one -- always emits
-    every known field's tag, populated or not, rather than ever omitting a
-    tag outright (the same pattern already seen with <STATKEY> always being
-    present even when its content isn't consumed by anything downstream).
-    A LEDGER with no <PARENT> tag AT ALL would be a different, more
-    structurally surprising shape than anything observed in real data so
-    far, so that case still fails loud rather than silently guessing "".
+    independently verified against a live Tally installation): no real
+    export seen so far has ever omitted the <PARENT> tag itself, only left
+    it empty. UPDATE (2026-08-10): the broader claim this reasoning
+    originally rested on -- "Tally always emits every known field's tag,
+    populated or not, never omitting one outright" -- turned out to be
+    wrong in general: <OPENINGBALANCE> IS omitted entirely by real Tally
+    exports for a zero balance (see _extract_ledger_masters_raw's handling
+    of it, added right after this was discovered). So Tally's real
+    behavior is field-specific, not a single blanket rule -- PARENT being
+    empty-but-present and OPENINGBALANCE being omitted-when-zero are two
+    different serialization choices for two different fields, not the same
+    pattern applied inconsistently. A <LEDGER> with no <PARENT> tag AT ALL
+    still hasn't been observed in any real file, so it still fails loud
+    here rather than silently guessing "" -- but this specific judgment
+    call should be revisited (the same way OPENINGBALANCE's was) the
+    moment a real file actually shows it.
     """
     child = element.find(tag)
     if child is None:
@@ -444,6 +455,33 @@ def _parse_decimal(raw: str, context: str) -> Decimal:
         return Decimal(raw)
     except InvalidOperation as e:
         raise TallyXmlParseError(f"{context}: could not parse '{raw}' as a decimal amount.") from e
+
+
+def _optional_decimal_element(element: ET.Element, tag: str, context: str, default: Decimal) -> Decimal:
+    """Like _required_text + _parse_decimal combined, but a completely
+    ABSENT element is treated as `default` rather than an error. If the
+    element IS present, it must still contain a valid, non-empty decimal --
+    this only changes what happens when the tag is missing outright, not
+    when it's present but malformed.
+
+    Confirmed against real client data (2026-08-10): Tally omits
+    <OPENINGBALANCE> entirely for a ledger whose opening balance is exactly
+    zero, rather than emitting <OPENINGBALANCE>0.00</OPENINGBALANCE> --
+    real example: the same reserved "Profit & Loss A/c" ledger from the
+    <PARENT/> fix (2026-08-09), which turned out to omit OPENINGBALANCE too,
+    just via a different mechanism (omitting the tag, not emitting it
+    empty -- see _required_element_optional_text's docstring for the
+    now-corrected assumption this contradicts). This is a general Tally
+    behavior, not specific to that one ledger -- applied here to every
+    <LEDGER>, since the same omission could plausibly appear on any ledger
+    with a genuinely zero opening balance, not just reserved ones.
+    """
+    child = element.find(tag)
+    if child is None:
+        return default
+    if child.text is None or not child.text.strip():
+        raise TallyXmlParseError(f"{context}: missing required <{tag}> element.")
+    return _parse_decimal(child.text.strip(), f"{context} {tag}")
 
 
 def _parse_tally_date(raw: str, context: str) -> str:
@@ -468,15 +506,19 @@ def _extract_ledger_masters_raw(root: ET.Element) -> Dict[str, TallyLedgerMaster
         if name in masters:
             raise TallyXmlParseError(f"Duplicate ledger master '{name}' -- ambiguous which opening balance is authoritative.")
 
-        # PARENT may legitimately be empty (<PARENT/>) -- see
+        # PARENT may legitimately be EMPTY (<PARENT/>) -- see
         # _required_element_optional_text's docstring for the confirmed
         # real-world case (Tally's reserved "Profit & Loss A/c" ledger has
-        # no parent group at all). OPENINGBALANCE has no such "legitimately
-        # blank" case -- an empty opening balance isn't a valid number, so
-        # it stays on the strict _required_text path.
+        # no parent group at all). OPENINGBALANCE may legitimately be
+        # ABSENT entirely -- a different omission mechanism for a different
+        # field, see _optional_decimal_element's docstring -- defaulting to
+        # a genuinely zero balance rather than erroring. If OPENINGBALANCE
+        # IS present, it must still be a valid, non-empty number; only its
+        # complete absence is treated as zero.
         parent = _required_element_optional_text(ledger_el, "PARENT", f"Ledger '{name}'")
-        opening_raw = _required_text(ledger_el, "OPENINGBALANCE", f"Ledger '{name}'")
-        opening_balance = _parse_decimal(opening_raw, f"Ledger '{name}' OPENINGBALANCE")
+        opening_balance = _optional_decimal_element(
+            ledger_el, "OPENINGBALANCE", f"Ledger '{name}'", default=Decimal("0.00")
+        )
 
         masters[name] = TallyLedgerMaster(name=name, parent=parent, opening_balance=opening_balance)
 

@@ -224,6 +224,88 @@ class EmptyParentLedgerTests(unittest.TestCase):
         self.assertEqual(data.closing_balance("Profit & Loss A/c"), Decimal("-75000.00"))
 
 
+class AbsentOpeningBalanceTests(unittest.TestCase):
+    """Covers a real client bug (2026-08-10), related to but distinct from
+    EmptyParentLedgerTests above: the real "Profit & Loss A/c" ledger has
+    NO <OPENINGBALANCE> element at all -- the tag is completely absent, not
+    just empty (unlike <PARENT/>, which IS present but empty). Confirmed as
+    a general Tally pattern (omitting a field entirely for its zero/default
+    value), not unique to this one ledger -- see
+    _optional_decimal_element in tally_xml_parser.py."""
+
+    def test_ledger_with_absent_openingbalance_defaults_to_zero(self):
+        xml = ENVELOPE_OPEN + b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Some Nominal Ledger" ACTION="Create">
+            <PARENT>Indirect Expenses</PARENT>
+          </LEDGER>
+        </TALLYMESSAGE>
+        """ + ENVELOPE_CLOSE
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.ledgers["Some Nominal Ledger"].opening_balance, Decimal("0.00"))
+
+    def test_ledger_with_present_but_empty_openingbalance_still_raises(self):
+        # Distinct from absence -- an EMPTY (but present) OPENINGBALANCE
+        # tag isn't the confirmed real shape and stays an error, unlike the
+        # PARENT case where present-but-empty is the legitimate one.
+        xml = ENVELOPE_OPEN + b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Some Ledger" ACTION="Create">
+            <PARENT>Indirect Expenses</PARENT>
+            <OPENINGBALANCE></OPENINGBALANCE>
+          </LEDGER>
+        </TALLYMESSAGE>
+        """ + ENVELOPE_CLOSE
+        with self.assertRaises(TallyXmlParseError) as ctx:
+            parse_tally_xml_data(xml)
+        self.assertIn("missing required <OPENINGBALANCE>", str(ctx.exception))
+
+    def test_ledger_with_unparseable_openingbalance_still_raises(self):
+        # A PRESENT OPENINGBALANCE with garbage content is still a real
+        # parse error -- only complete absence defaults to zero.
+        xml = build_xml(ledger_xml("Some Ledger", "Indirect Expenses", "not-a-number"))
+        with self.assertRaises(TallyXmlParseError) as ctx:
+            parse_tally_xml_data(xml)
+        self.assertIn("could not parse", str(ctx.exception))
+
+    def test_profit_and_loss_ledger_exact_real_shape_parses_correctly(self):
+        # The exact real-world shape: <PARENT/> (empty, present) AND
+        # <OPENINGBALANCE> (completely absent), together on the same
+        # ledger -- both fixes must hold at once.
+        xml = ENVELOPE_OPEN + b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Profit &amp; Loss A/c" ACTION="Create">
+            <PARENT/>
+          </LEDGER>
+        </TALLYMESSAGE>
+        """ + ENVELOPE_CLOSE
+        data = parse_tally_xml_data(xml)
+        pl = data.ledgers["Profit & Loss A/c"]
+        self.assertEqual(pl.parent, "")
+        self.assertEqual(pl.opening_balance, Decimal("0.00"))
+
+    def test_absent_openingbalance_default_is_not_special_cased_to_one_ledger_name(self):
+        # The fix must apply to ANY ledger, not just ones named
+        # "Profit & Loss A/c" -- the same omission could plausibly appear
+        # on any ledger with a genuinely zero opening balance.
+        xml = ENVELOPE_OPEN + b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Freight Suspense" ACTION="Create">
+            <PARENT>Indirect Expenses</PARENT>
+          </LEDGER>
+        </TALLYMESSAGE>
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Rounding Off" ACTION="Create">
+            <PARENT>Indirect Expenses</PARENT>
+            <OPENINGBALANCE>0.00</OPENINGBALANCE>
+          </LEDGER>
+        </TALLYMESSAGE>
+        """ + ENVELOPE_CLOSE
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.ledgers["Freight Suspense"].opening_balance, Decimal("0.00"))
+        self.assertEqual(data.ledgers["Rounding Off"].opening_balance, Decimal("0.00"))
+
+
 class TallyDataStructureTests(unittest.TestCase):
     def test_voucher_fields_preserved(self):
         xml = build_xml(

@@ -274,14 +274,31 @@ Implementation, so a future session can find the pieces:
     raises, a judgment call based on every real file seen so far always
     emitting every known field's tag (populated or not) rather than ever
     omitting one outright -- same pattern already established for
-    `<STATKEY>` above. `OPENINGBALANCE` is unaffected and still requires
-    non-empty text (an empty opening balance isn't a valid number, unlike
-    an empty parent group, which is a real, meaningful state). An empty-
-    string `parent` resolves correctly through `TallyData.
-    resolve_top_level_group` (stops immediately, since `""` is never a key
-    in `groups`) without falsely matching any of `PROFIT_AND_LOSS_
-    PARENT_GROUPS`, so a reserved ledger like this stays correctly
-    classified as a permanent/balance-sheet ledger, not excluded as P&L.
+    `<STATKEY>` above. An empty-string `parent` resolves correctly through
+    `TallyData.resolve_top_level_group` (stops immediately, since `""` is
+    never a key in `groups`) without falsely matching any of
+    `PROFIT_AND_LOSS_PARENT_GROUPS`, so a reserved ledger like this stays
+    correctly classified as a permanent/balance-sheet ledger, not excluded
+    as P&L.
+  - **A `<LEDGER>` with `<OPENINGBALANCE>` completely ABSENT is a legitimate
+    zero opening balance, not a missing-field error** (fixed 2026-08-10, a
+    related but distinct real client bug found right after the `<PARENT/>`
+    fix above -- same `"Profit & Loss A/c"` ledger, but a different
+    omission mechanism for a different field: Tally leaves `<PARENT/>`
+    EMPTY-BUT-PRESENT, but OMITS `<OPENINGBALANCE>` ENTIRELY when it's
+    zero, rather than writing `<OPENINGBALANCE>0.00</OPENINGBALANCE>`.
+    **This directly contradicted the judgment call the `<PARENT/>` fix
+    rested on** ("Tally always emits every known field's tag, populated or
+    not, never omitting one outright") -- corrected in
+    `_required_element_optional_text`'s docstring to note Tally's real
+    behavior is field-specific, not one blanket rule. `_optional_decimal_
+    element` (new) treats a completely absent element as a caller-supplied
+    default (`Decimal("0.00")` for `OPENINGBALANCE`) rather than erroring;
+    if the element IS present, it must still contain a valid, non-empty
+    decimal -- only complete absence gets the default, not an empty or
+    garbage value. Applied generally to every `<LEDGER>`, not special-cased
+    by ledger name, since the same omission could plausibly appear on any
+    ledger with a genuinely zero opening balance.
   - Real exports commonly arrive as **two separate files** -- one with only
     `<GROUP>`/`<LEDGER>` masters, another with only `<VOUCHER>` entries --
     rather than one combined file, and both can carry the same
@@ -294,12 +311,14 @@ Implementation, so a future session can find the pieces:
     combined entry point. `parse_tally_xml_data` (single file) is
     unchanged/backward compatible -- still requires the file to be
     self-contained.
-  Unit tests: `tests/test_tally_xml_parser.py` (65 tests: sign-convention
+  Unit tests: `tests/test_tally_xml_parser.py` (70 tests: sign-convention
   math, P&L filtering, group-hierarchy resolution, encoding normalization
   — including both the entity-reference and raw-literal illegal-character
   cases — split-file merging, the `TallyXmlParseError` subclass hierarchy
-  (`ErrorSubclassTests`), the empty-`<PARENT/>` fix (`EmptyParentLedgerTests`),
-  every rejection path, `TallyData` field/method coverage) plus
+  (`ErrorSubclassTests`), the empty-`<PARENT/>` fix
+  (`EmptyParentLedgerTests`), the absent-`<OPENINGBALANCE>` fix
+  (`AbsentOpeningBalanceTests`), every rejection path, `TallyData`
+  field/method coverage) plus
   `tests/test_parse_error_classification.py` (10 tests) for
   `parse_error_classification.py`. Real-world-scale regression check
   (standalone, not part of `unittest discover` -- see below):
