@@ -41,9 +41,12 @@ Encoding
 Real exports are commonly UTF-16 with a byte-order mark, not UTF-8 (also
 confirmed against real user files, 2026-08-06) -- every entry point takes
 raw bytes (never a decoded str) and sniffs the encoding itself via
-_normalize_xml_encoding, which also strips numeric character references to
-codepoints XML 1.0 doesn't allow at all (observed in the same real files,
-e.g. &#4;) before handing anything to ElementTree.
+_normalize_xml_encoding, which also strips characters XML 1.0 doesn't allow
+at all before handing anything to ElementTree -- both as a numeric entity
+reference (observed 2026-08-06, e.g. &#4;) and, distinctly, as a raw
+character embedded literally in the decoded text (observed 2026-08-07,
+inside a <STATKEY> field -- see _strip_raw_illegal_control_chars). Neither
+form is meaningful accounting data; both are dropped entirely.
 
 Why computing a closing balance is harder than reading a CSV cell
 ----------------------------------------------------------------------
@@ -169,6 +172,15 @@ def _is_valid_xml_char(codepoint: int) -> bool:
 _NUMERIC_ENTITY_RE = re.compile(r"&#(x?)([0-9a-fA-F]+);")
 _XML_DECLARATION_RE = re.compile(rb"^\s*<\?xml[^>]*\?>\s*")
 
+# Precomputed once at import: every BMP codepoint XML 1.0 doesn't allow
+# literally in content, mapped to None (str.translate deletes it). Only the
+# BMP (0x0-0xFFFF) needs entries -- every codepoint from 0x10000-0x10FFFF is
+# valid per _is_valid_xml_char, so translate() leaves those untouched
+# automatically (an unmapped codepoint passes through as-is). Built from
+# _is_valid_xml_char itself so this can never drift out of sync with the one
+# definition of "valid" both stripping functions below rely on.
+_ILLEGAL_XML_CHAR_TRANSLATION = {cp: None for cp in range(0x0, 0x10000) if not _is_valid_xml_char(cp)}
+
 
 def _strip_invalid_numeric_entities(text: str) -> str:
     """Removes numeric character references (&#4; or &#x4;) that point at a
@@ -177,6 +189,10 @@ def _strip_invalid_numeric_entities(text: str) -> str:
     dropping the reference entirely is equivalent to the stray control
     character never having been there. A *valid* numeric reference (e.g.
     &#8377; for the Rupee sign) is left untouched.
+
+    This only handles the &#N; ENTITY spelling of an illegal character --
+    see _strip_raw_illegal_control_chars for the same problem when the
+    illegal character is embedded literally, not as an entity reference.
     """
     def _replace(m: "re.Match[str]") -> str:
         codepoint = int(m.group(2), 16 if m.group(1) else 10)
@@ -184,15 +200,54 @@ def _strip_invalid_numeric_entities(text: str) -> str:
     return _NUMERIC_ENTITY_RE.sub(_replace, text)
 
 
+def _strip_raw_illegal_control_chars(text: str) -> str:
+    """Removes characters embedded LITERALLY in decoded text that XML 1.0
+    does not allow in content at all -- a distinct problem from
+    _strip_invalid_numeric_entities above, which only catches the &#N;
+    entity-reference spelling. Confirmed against real user files
+    (2026-08-07): a <STATKEY> field contained a raw ASCII 0x05 (ENQ) control
+    character written directly into the text, not spelled out as &#5; --
+    e.g. "2023\\x05376\\x05Outward Invoice\\x05S1.4.2023", where 0x05 looks
+    to be Tally's own internal delimiter joining several values into one
+    field. expat rejects a literal illegal character exactly as it rejects
+    the equivalent entity reference, regardless of which form produced it,
+    so this covers the full XML 1.0 illegal range (via _is_valid_xml_char /
+    _ILLEGAL_XML_CHAR_TRANSLATION) rather than just the one control
+    character observed so far -- nothing guarantees 0x05 is the only one
+    Tally ever emits raw.
+
+    Applied to the WHOLE document text, not just STATKEY: encoding
+    normalization runs before any per-element parsing, so at this point
+    there is no way to know which tag a given character sits inside, and an
+    illegal literal character anywhere breaks well-formedness for the
+    entire file, not just for its own field -- scoping this to one tag
+    isn't possible at this stage even if it were desirable. STATKEY's
+    content isn't consumed by any check this project runs today, so
+    stripping delimiter characters out of it is harmless -- it was already
+    effectively discarded either way. CAVEAT (unconfirmed either way against
+    real data, flagging rather than guessing): if this same delimiter
+    pattern ever shows up inside a field this project DOES read, e.g.
+    NARRATION or LEDGERNAME, stripping the delimiter would silently
+    concatenate that field's joined sub-values with no separator between
+    them, rather than just discarding noise -- worth specifically checking
+    NARRATION/LEDGERNAME content if a future real file trips this path.
+    """
+    return text.translate(_ILLEGAL_XML_CHAR_TRANSLATION)
+
+
 def _normalize_xml_encoding(xml_bytes: bytes) -> bytes:
     """Real Tally exports are commonly UTF-16 with a BOM (confirmed against
     real user files, 2026-08-06) rather than the UTF-8 every sample this
     project had previously been tested against uses. Sniffs the BOM (UTF-16
-    LE/BE, or UTF-8) to decode correctly, strips any invalid numeric
-    character references (see _strip_invalid_numeric_entities), and
-    re-encodes everything to plain UTF-8 bytes with no leading BOM -- so the
-    rest of this module, and ElementTree/expat, only ever have to deal with
-    one encoding.
+    LE/BE, or UTF-8) to decode correctly, strips any illegal-per-XML-1.0
+    characters -- both the &#N; entity-reference form (see
+    _strip_invalid_numeric_entities) and the same characters embedded
+    literally/raw in the text (see _strip_raw_illegal_control_chars, added
+    2026-08-07 after real user files turned up a raw control character
+    Tally itself doesn't seem to mind emitting but expat rejects outright)
+    -- and re-encodes everything to plain UTF-8 bytes with no leading BOM,
+    so the rest of this module, and ElementTree/expat, only ever have to
+    deal with one encoding.
 
     Re-encoding to UTF-8 ourselves (rather than relying on
     ElementTree/expat's own BOM autodetection) also sidesteps a specific
@@ -220,6 +275,7 @@ def _normalize_xml_encoding(xml_bytes: bytes) -> bytes:
             ) from e
 
     text = _strip_invalid_numeric_entities(text)
+    text = _strip_raw_illegal_control_chars(text)
     normalized = text.encode("utf-8")
     return _XML_DECLARATION_RE.sub(b"", normalized, count=1)
 

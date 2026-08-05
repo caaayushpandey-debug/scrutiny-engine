@@ -5,6 +5,7 @@ from tally_xml_parser import (
     TallyXmlParseError,
     _normalize_xml_encoding,
     _strip_invalid_numeric_entities,
+    _strip_raw_illegal_control_chars,
     merge_tally_xml_fragments,
     parse_tally_xml,
     parse_tally_xml_data,
@@ -278,8 +279,10 @@ class GroupHierarchyResolutionTests(unittest.TestCase):
 class EncodingTests(unittest.TestCase):
     """Covers _normalize_xml_encoding -- real Tally exports are commonly
     UTF-16 with a BOM, not UTF-8 (confirmed against real user files,
-    2026-08-06), and can contain numeric character references to codepoints
-    XML 1.0 doesn't allow at all (e.g. &#4;)."""
+    2026-08-06), and can contain characters XML 1.0 doesn't allow at all,
+    either as a numeric character reference (e.g. &#4;) or, distinctly,
+    embedded raw/literally in the decoded text (e.g. a bare 0x05 byte inside
+    a <STATKEY> field, confirmed against real user files 2026-08-07)."""
 
     def test_utf16_le_with_bom_parses_correctly(self):
         xml = build_xml(
@@ -332,6 +335,28 @@ class EncodingTests(unittest.TestCase):
         text = 'Amount: &#8377;1,000'
         self.assertEqual(_strip_invalid_numeric_entities(text), text)
 
+    def test_strip_raw_illegal_control_chars_removes_raw_control_char(self):
+        # Confirmed against real user files (2026-08-07): a <STATKEY> field
+        # containing a raw (not entity-encoded) ASCII 0x05 -- Tally's own
+        # internal delimiter joining several values into one field.
+        text = "2023\x05376\x05Outward Invoice\x05S1.4.2023"
+        self.assertEqual(_strip_raw_illegal_control_chars(text), "2023376Outward InvoiceS1.4.2023")
+
+    def test_strip_raw_illegal_control_chars_covers_full_illegal_range_not_just_0x05(self):
+        # The fix must not be hardcoded to the one control character
+        # actually observed -- nothing guarantees Tally only ever emits
+        # 0x05 raw; cover a spread across the whole XML 1.0 illegal range
+        # (see _is_valid_xml_char).
+        text = "A\x00B\x01C\x08D\x0bE\x0cF\x0eG\x1fH"
+        self.assertEqual(_strip_raw_illegal_control_chars(text), "ABCDEFGH")
+
+    def test_strip_raw_illegal_control_chars_preserves_valid_whitespace_and_text(self):
+        # Tab, newline, and carriage return ARE valid XML 1.0 characters
+        # (see _is_valid_xml_char) despite being control characters -- must
+        # not be stripped alongside the illegal ones.
+        text = "Line one\twith a tab\nLine two\r\nNormal punctuation: ₹1,000.00 (50%)."
+        self.assertEqual(_strip_raw_illegal_control_chars(text), text)
+
     def test_invalid_numeric_entity_in_narration_does_not_break_parsing(self):
         xml = ENVELOPE_OPEN + ledger_xml("HDFC Bank", "Bank Accounts", "1000.00") + ledger_xml(
             "Sales Account", "Sales Accounts", "0.00"
@@ -357,6 +382,41 @@ class EncodingTests(unittest.TestCase):
         """ + ENVELOPE_CLOSE
         data = parse_tally_xml_data(xml)
         self.assertEqual(data.vouchers[0].narration, "Invoice with stray control char  embedded.")
+
+    def test_raw_control_char_in_statkey_does_not_break_parsing(self):
+        # Regression for the real failure (2026-08-07): unlike &#4; above,
+        # this control character is embedded LITERALLY in the file's bytes,
+        # not spelled out as a numeric entity reference -- expat rejects it
+        # as "not well-formed" exactly the same either way, so it must be
+        # stripped as raw text too, not just when it appears as an entity.
+        xml = ENVELOPE_OPEN + ledger_xml("HDFC Bank", "Bank Accounts", "1000.00") + ledger_xml(
+            "Sales Account", "Sales Accounts", "0.00"
+        ) + """
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <VOUCHER VCHTYPE="Sales" ACTION="Create">
+            <DATE>20250401</DATE>
+            <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+            <VOUCHERNUMBER>SI-0001</VOUCHERNUMBER>
+            <NARRATION>Test voucher.</NARRATION>
+            <STATKEY>2023\x05376\x05Outward Invoice\x05S1.4.2023</STATKEY>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>HDFC Bank</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+              <AMOUNT>-500.00</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>Sales Account</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+              <AMOUNT>500.00</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+          </VOUCHER>
+        </TALLYMESSAGE>
+        """.encode() + ENVELOPE_CLOSE
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(len(data.vouchers), 1)
+        self.assertEqual(data.vouchers[0].voucher_number, "SI-0001")
+        self.assertEqual(data.vouchers[0].narration, "Test voucher.")
+        self.assertEqual(data.closing_balance("HDFC Bank"), Decimal("1500.00"))
 
     def test_stale_encoding_declaration_after_reencoding_does_not_break_expat(self):
         # After decoding UTF-16 and re-encoding to UTF-8, the original

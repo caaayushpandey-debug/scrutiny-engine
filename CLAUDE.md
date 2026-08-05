@@ -223,9 +223,31 @@ Implementation, so a future session can find the pieces:
     Every entry point takes raw bytes and sniffs the encoding itself via
     `_normalize_xml_encoding` (BOM-based: UTF-16 LE/BE or UTF-8; falls back
     to plain UTF-8 if no BOM, so every pre-existing sample still works
-    unchanged) and also strips numeric character references to codepoints
-    XML 1.0 doesn't allow at all (e.g. `&#4;`, also observed in real
-    exports) before handing anything to `ElementTree`.
+    unchanged) and also strips characters XML 1.0 doesn't allow at all
+    before handing anything to `ElementTree` — both as a **numeric entity
+    reference** (e.g. `&#4;`, `_strip_invalid_numeric_entities`) and,
+    **found separately on 2026-08-07**, the same characters embedded
+    **raw/literally** in the decoded text (`_strip_raw_illegal_control_chars`)
+    — a real file had a bare ASCII `0x05` byte directly inside a
+    `<STATKEY>` field (e.g. `"2023\x05376\x05Outward Invoice\x05S1.4.2023"`,
+    apparently Tally's own internal delimiter joining several values into
+    one field), which the entity-only fix didn't catch since it was never
+    spelled out as `&#5;`. Both strip functions share the one definition of
+    "valid" (`_is_valid_xml_char`) so they can't drift apart, and the raw
+    version covers the *entire* XML 1.0 illegal range via a precomputed
+    `str.translate` table, not just `0x05` — nothing guarantees that's the
+    only raw control character Tally ever emits. `STATKEY` isn't read by
+    any check today, so stripping is harmless there, but the strip runs
+    over the WHOLE document (encoding normalization happens before any
+    per-element parsing, so there's no way to scope it to one tag, and an
+    illegal literal character anywhere breaks well-formedness for the whole
+    file regardless of which field it's in) — **flagged, not yet confirmed
+    either way against real data**: if this same delimiter pattern ever
+    shows up inside a field this project actually reads (`NARRATION`,
+    `LEDGERNAME`), stripping would silently concatenate that field's joined
+    sub-values with no separator, losing real information rather than
+    discarding noise. Worth specifically checking those two fields if a
+    future real file trips this path.
   - Real exports commonly arrive as **two separate files** -- one with only
     `<GROUP>`/`<LEDGER>` masters, another with only `<VOUCHER>` entries --
     rather than one combined file, and both can carry the same
@@ -238,9 +260,10 @@ Implementation, so a future session can find the pieces:
     combined entry point. `parse_tally_xml_data` (single file) is
     unchanged/backward compatible -- still requires the file to be
     self-contained.
-  Unit tests: `tests/test_tally_xml_parser.py` (48 tests: sign-convention
-  math, P&L filtering, group-hierarchy resolution, encoding normalization,
-  split-file merging, every rejection path, `TallyData` field/method
+  Unit tests: `tests/test_tally_xml_parser.py` (52 tests: sign-convention
+  math, P&L filtering, group-hierarchy resolution, encoding normalization
+  — including both the entity-reference and raw-literal illegal-character
+  cases — split-file merging, every rejection path, `TallyData` field/method
   coverage). Real-world-scale regression check (standalone, not part of
   `unittest discover` -- see below): `tests/verify_large_split_utf16_files.py`
   generates a ~9MB UTF-16 masters file + ~61MB UTF-16 transactions file on
