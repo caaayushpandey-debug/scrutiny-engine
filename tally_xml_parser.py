@@ -5,10 +5,14 @@ Reference schema: the same Tally Import/Export XML shape documented in
 generators/tally_xml/generate_tally_xml.py docstring for the exact citation
 of Tally's own Developer Reference and public sample exports this is based
 on) -- ENVELOPE > HEADER/BODY > IMPORTDATA > REQUESTDESC/REQUESTDATA >
-TALLYMESSAGE, each containing either a LEDGER master or a VOUCHER. LEDGER
-uses NAME (attribute), PARENT, OPENINGBALANCE. VOUCHER uses VCHTYPE
-(attribute), VOUCHERNUMBER, DATE, NARRATION, and one ALLLEDGERENTRIES.LIST
-per leg (LEDGERNAME, ISDEEMEDPOSITIVE, AMOUNT).
+TALLYMESSAGE, each containing a LEDGER master, a GROUP master, or a VOUCHER.
+LEDGER uses NAME (attribute), PARENT, OPENINGBALANCE. GROUP uses NAME
+(attribute) and PARENT -- Tally only emits a GROUP master for a
+company-created custom group (its own built-in reserved primary groups never
+get one; see schemas/tally_data.py's TallyGroupMaster and
+TallyData.resolve_top_level_group). VOUCHER uses VCHTYPE (attribute),
+VOUCHERNUMBER, DATE, NARRATION, and one ALLLEDGERENTRIES.LIST per leg
+(LEDGERNAME, ISDEEMEDPOSITIVE, AMOUNT).
 
 Two entry points
 ------------------
@@ -54,11 +58,13 @@ primary groups, which cleanly separates the two: PROFIT_AND_LOSS_PARENT_GROUPS
 below is exactly Tally's own list of P&L primary groups (Sales Accounts,
 Purchase Accounts, Direct/Indirect Incomes, Direct/Indirect Expenses) -- not
 something specific to any one company's naming choices. parse_tally_xml
-excludes any ledger whose PARENT is one of those groups from the TrialBalance
-it returns. This is a direct PARENT-string match against the primary group
-only; it does not resolve a nested custom-group hierarchy (e.g. "Sales
-Accounts > Domestic") -- not needed for this generator's output, which never
-nests groups, but worth revisiting if a real-world export does.
+excludes any ledger whose PARENT *resolves to* one of those groups (see
+TallyData.resolve_top_level_group, added 2026-08-05) from the TrialBalance it
+returns -- this walks any custom sub-group nesting (e.g. a company-created
+"Domestic Sales" group nested under the built-in "Sales Accounts") rather
+than only matching a ledger's immediate PARENT string, since real-world
+exports (unlike this generator's output, which never nests groups) commonly
+do nest custom groups under a standard one.
 
 KNOWN LIMITATION, found while building checks/opening_balance_vs_prior_year_closing.py
 against real Tally data (2026-08-02): that check compares a stated opening
@@ -82,6 +88,9 @@ Failure modes (raises TallyXmlParseError, never silently misparses)
 - No <LEDGER> masters found at all.
 - A <LEDGER> with no NAME attribute, a missing PARENT/OPENINGBALANCE, an
   unparseable OPENINGBALANCE, or a NAME that duplicates an earlier ledger.
+- A <GROUP> with no NAME attribute, or a NAME that duplicates an earlier
+  group (a missing PARENT is tolerated, unlike LEDGER -- see
+  _extract_group_masters).
 - A <VOUCHER> with fewer than 2 ledger entries (not valid double-entry), a
   ledger entry missing LEDGERNAME/ISDEEMEDPOSITIVE/AMOUNT, an
   ISDEEMEDPOSITIVE value that isn't exactly "Yes"/"No", an AMOUNT that can't
@@ -97,7 +106,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, List, Set
 
-from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
+from schemas.tally_data import TallyData, TallyGroupMaster, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
 
 PROFIT_AND_LOSS_PARENT_GROUPS = {
@@ -154,6 +163,30 @@ def _extract_ledger_masters(root: ET.Element) -> Dict[str, TallyLedgerMaster]:
         raise TallyXmlParseError("No <LEDGER> master elements found -- doesn't look like a Tally export.")
 
     return masters
+
+
+def _extract_group_masters(root: ET.Element) -> Dict[str, TallyGroupMaster]:
+    """Parses <GROUP> master elements into custom-group name -> parent
+    entries (see TallyGroupMaster's docstring for why only custom groups
+    appear here, never Tally's built-in primary groups). Unlike a LEDGER's
+    PARENT, a GROUP's PARENT is not required here -- Tally itself always
+    populates one for a real custom group, but treating a missing PARENT as
+    a parse error would be too strict for a master element that (unlike
+    LEDGER/VOUCHER) this project doesn't otherwise validate; it just becomes
+    a dead end for resolve_top_level_group's walk instead.
+    """
+    groups: Dict[str, TallyGroupMaster] = {}
+    for group_el in root.iter("GROUP"):
+        name = group_el.get("NAME")
+        if not name:
+            raise TallyXmlParseError("Found a <GROUP> element with no NAME attribute.")
+        if name in groups:
+            raise TallyXmlParseError(f"Duplicate group master '{name}' -- ambiguous which parent is authoritative.")
+
+        parent = group_el.findtext("PARENT") or ""
+        groups[name] = TallyGroupMaster(name=name, parent=parent.strip())
+
+    return groups
 
 
 def _extract_vouchers(root: ET.Element, known_ledger_names: Set[str]) -> List[TallyVoucher]:
@@ -224,8 +257,9 @@ def parse_tally_xml_data(xml_bytes: bytes) -> TallyData:
         raise TallyXmlParseError(f"Expected root element <ENVELOPE>, found <{root.tag}> -- doesn't look like a Tally export.")
 
     masters = _extract_ledger_masters(root)
+    groups = _extract_group_masters(root)
     vouchers = _extract_vouchers(root, set(masters))
-    return TallyData(ledgers=masters, vouchers=vouchers)
+    return TallyData(ledgers=masters, vouchers=vouchers, groups=groups)
 
 
 def parse_tally_xml_data_file(path: str) -> TallyData:
@@ -245,7 +279,7 @@ def parse_tally_xml(xml_bytes: bytes) -> TrialBalance:
 
     ledgers: List[LedgerBalance] = []
     for name, master in data.ledgers.items():
-        if master.parent in PROFIT_AND_LOSS_PARENT_GROUPS:
+        if data.resolve_top_level_group(name) in PROFIT_AND_LOSS_PARENT_GROUPS:
             continue
         closing = data.closing_balance(name)
         debit = closing if closing >= 0 else Decimal("0.00")

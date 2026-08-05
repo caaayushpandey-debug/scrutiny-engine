@@ -26,6 +26,16 @@ def ledger_xml(name, parent, opening):
     """.encode()
 
 
+def group_xml(name, parent):
+    return f"""
+    <TALLYMESSAGE xmlns:UDF="TallyUDF">
+      <GROUP NAME="{name}" ACTION="Create">
+        <PARENT>{parent}</PARENT>
+      </GROUP>
+    </TALLYMESSAGE>
+    """.encode()
+
+
 def voucher_xml(vch_type, vn, legs):
     """legs: list of (ledger_name, is_debit, amount_str)"""
     entries = "".join(f"""
@@ -155,6 +165,95 @@ class TallyDataStructureTests(unittest.TestCase):
         self.assertEqual(len(touching), 1)
         self.assertEqual(touching[0].voucher_number, "SI-0001")
         self.assertEqual(data.vouchers_touching("Sales Account")[0].voucher_number, "SI-0001")
+
+
+class GroupHierarchyResolutionTests(unittest.TestCase):
+    """Covers TallyData.resolve_top_level_group and the parse_tally_xml
+    P&L-filtering fix that uses it (2026-08-05) -- a ledger filed under a
+    company-created custom sub-group (nested under a standard Tally primary
+    group, possibly several levels deep) should resolve to that primary
+    group, not get stuck on its own immediate PARENT string."""
+
+    def test_ledger_under_primary_group_with_no_groups_at_all(self):
+        # Regression case: matches every real sample this project has seen
+        # so far (zero <GROUP> masters, every ledger's PARENT already a
+        # primary group) -- resolution must be a no-op in this case.
+        xml = build_xml(ledger_xml("Axis Bank CC A/c", "Bank Accounts", "1000.00"))
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.resolve_top_level_group("Axis Bank CC A/c"), "Bank Accounts")
+
+    def test_ledger_under_custom_subgroup_resolves_to_primary_group(self):
+        # "Overseas Debtors" is a custom group a company created, nested
+        # directly under the standard "Sundry Debtors" primary group.
+        xml = build_xml(
+            group_xml("Overseas Debtors", "Sundry Debtors"),
+            ledger_xml("Meridian Global Trading LLC", "Overseas Debtors", "500000.00"),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertIn("Overseas Debtors", data.groups)
+        self.assertEqual(data.groups["Overseas Debtors"].parent, "Sundry Debtors")
+        self.assertEqual(data.resolve_top_level_group("Meridian Global Trading LLC"), "Sundry Debtors")
+
+    def test_multi_level_custom_group_chain_resolves_to_primary_group(self):
+        # Two custom levels deep: ledger -> "APAC Overseas Debtors" ->
+        # "Overseas Debtors" -> "Sundry Debtors" (primary, no GROUP master).
+        xml = build_xml(
+            group_xml("Overseas Debtors", "Sundry Debtors"),
+            group_xml("APAC Overseas Debtors", "Overseas Debtors"),
+            ledger_xml("Meridian Global Trading LLC", "APAC Overseas Debtors", "500000.00"),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.resolve_top_level_group("Meridian Global Trading LLC"), "Sundry Debtors")
+
+    def test_pl_filtering_excludes_ledger_under_custom_subgroup_of_pl_group(self):
+        # The actual bug this fixes: without hierarchy resolution, a ledger
+        # under a custom sub-group of a P&L primary group would incorrectly
+        # survive parse_tally_xml's balance-sheet filtering (its immediate
+        # PARENT, "Domestic Sales", doesn't literally match
+        # PROFIT_AND_LOSS_PARENT_GROUPS even though it structurally is one).
+        xml = build_xml(
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            group_xml("Domestic Sales", "Sales Accounts"),
+            ledger_xml("Sales - Domestic", "Domestic Sales", "0.00"),
+        )
+        tb = parse_tally_xml(xml)
+        self.assertEqual([l.name for l in tb.ledgers], ["HDFC Bank"])
+
+    def test_cyclical_group_chain_does_not_infinite_loop(self):
+        # Not a real Tally export (Tally itself doesn't allow creating a
+        # cycle), but corrupt/hand-edited input shouldn't hang the parser.
+        xml = build_xml(
+            group_xml("Group A", "Group B"),
+            group_xml("Group B", "Group A"),
+            ledger_xml("Some Ledger", "Group A", "0.00"),
+        )
+        data = parse_tally_xml_data(xml)
+        # Just needs to terminate and return *something* -- which specific
+        # node it stops on isn't the contract, only that it doesn't hang.
+        result = data.resolve_top_level_group("Some Ledger")
+        self.assertIn(result, ("Group A", "Group B"))
+
+    def test_duplicate_group_name_raises(self):
+        xml = build_xml(
+            group_xml("Overseas Debtors", "Sundry Debtors"),
+            group_xml("Overseas Debtors", "Sundry Debtors"),
+            ledger_xml("Some Ledger", "Overseas Debtors", "0.00"),
+        )
+        with self.assertRaises(TallyXmlParseError) as ctx:
+            parse_tally_xml_data(xml)
+        self.assertIn("Duplicate group", str(ctx.exception))
+
+    def test_group_with_no_name_raises(self):
+        xml = build_xml(b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <GROUP ACTION="Create">
+            <PARENT>Sundry Debtors</PARENT>
+          </GROUP>
+        </TALLYMESSAGE>
+        """, ledger_xml("Some Ledger", "Sundry Debtors", "0.00"))
+        with self.assertRaises(TallyXmlParseError) as ctx:
+            parse_tally_xml_data(xml)
+        self.assertIn("NAME attribute", str(ctx.exception))
 
 
 class RejectionTests(unittest.TestCase):

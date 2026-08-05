@@ -21,8 +21,10 @@ Endpoints:
   parsing logic), so the frontend doesn't have to parse Trial Balance CSVs
   itself before calling /run-checks.
 - POST /parse-tally-xml, a raw-Tally-XML-upload -> structured TallyData
-  ({"ledgers": [...], "vouchers": [...]}) preprocessing step (see
-  tally_xml_parser.py).
+  ({"ledgers": [...], "vouchers": [...], "groups": [...]}) preprocessing step
+  (see tally_xml_parser.py). "groups" is only the company's own custom
+  <GROUP> masters (may be empty) -- see schemas/tally_data.py's
+  TallyGroupMaster/resolve_top_level_group for why.
 - POST /run-suspense-check, wrapping checks/suspense_account_scrutiny.py
   specifically (same one-check-per-endpoint approach as /run-checks, not a
   registry-driven dispatcher). Takes the same TallyData shape
@@ -235,5 +237,9 @@ async def parse_tally_xml(file: UploadFile = File(...)) -> dict:
                 ],
             }
             for v in tally_data.vouchers
+        ],
+        "groups": [
+            {"name": g.name, "parent": g.parent}
+            for g in tally_data.groups.values()
         ],
     }
