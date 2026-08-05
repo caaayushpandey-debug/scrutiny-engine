@@ -14,8 +14,8 @@ TallyData.resolve_top_level_group). VOUCHER uses VCHTYPE (attribute),
 VOUCHERNUMBER, DATE, NARRATION, and one ALLLEDGERENTRIES.LIST per leg
 (LEDGERNAME, ISDEEMEDPOSITIVE, AMOUNT).
 
-Two entry points
-------------------
+Two entry points for a single, self-contained file
+---------------------------------------------------
 - `parse_tally_xml_data` returns a `schemas.tally_data.TallyData` -- ledger
   masters plus every voucher, fully preserved (voucher number, date,
   narration, every leg). Checks that need to reason about *which specific
@@ -25,6 +25,25 @@ Two entry points
   (one net balance per permanent ledger) -- see "Balance-sheet vs P&L
   filtering" below. This exists for checks that only need a stated balance
   per ledger, the same shape trial_balance_csv_parser.py produces.
+
+A third entry point for a real-world SPLIT export
+----------------------------------------------------
+`parse_tally_xml_data_multi(files: List[bytes])` -- confirmed against real
+user files (2026-08-06), Tally commonly exports a company's masters
+(<GROUP>/<LEDGER>) and transactions (<VOUCHER>) as two SEPARATE files rather
+than one combined file. Pass both (in either order) and it merges them into
+one TallyData, the same shape parse_tally_xml_data returns. See "Split
+masters/transactions exports" further down for the full explanation,
+including why <REPORTNAME> is never trusted to tell the two apart.
+
+Encoding
+--------
+Real exports are commonly UTF-16 with a byte-order mark, not UTF-8 (also
+confirmed against real user files, 2026-08-06) -- every entry point takes
+raw bytes (never a decoded str) and sniffs the encoding itself via
+_normalize_xml_encoding, which also strips numeric character references to
+codepoints XML 1.0 doesn't allow at all (observed in the same real files,
+e.g. &#4;) before handing anything to ElementTree.
 
 Why computing a closing balance is harder than reading a CSV cell
 ----------------------------------------------------------------------
@@ -96,15 +115,23 @@ Failure modes (raises TallyXmlParseError, never silently misparses)
   ISDEEMEDPOSITIVE value that isn't exactly "Yes"/"No", an AMOUNT that can't
   be parsed as a decimal or whose sign is inconsistent with ISDEEMEDPOSITIVE,
   a voucher whose legs don't sum to zero, or a leg referencing a ledger name
-  with no matching <LEDGER> master.
+  with no matching <LEDGER> master (for parse_tally_xml_data_multi, this
+  last check is only raised once no fragment anywhere in the upload has a
+  matching master -- see "Split masters/transactions exports").
 - (parse_tally_xml only) after excluding P&L-group ledgers, nothing
   permanent is left to check.
+- (parse_tally_xml_data_multi only) no <LEDGER> masters found in ANY of the
+  supplied files, or the same ledger/group name defined in more than one of
+  them (ambiguous which is authoritative).
+- Cannot decode a file as UTF-8 or UTF-16 (checked via byte-order mark).
 """
+import codecs
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 from schemas.tally_data import TallyData, TallyGroupMaster, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
@@ -121,6 +148,98 @@ PROFIT_AND_LOSS_PARENT_GROUPS = {
 
 class TallyXmlParseError(ValueError):
     """Raised when a file cannot be confidently parsed as this Tally XML export shape."""
+
+
+# Valid XML 1.0 character ranges (spec section 2.2) -- everything else is
+# not well-formed XML at all, even as a numeric character reference. Real
+# Tally exports have been observed (2026-08-06, against real user files)
+# containing references like &#4; (a C0 control character, "End of
+# Transmission") that violate this -- Tally itself doesn't seem to mind
+# emitting them, but expat (which ElementTree uses) rejects them outright as
+# not well-formed. See _strip_invalid_numeric_entities below.
+def _is_valid_xml_char(codepoint: int) -> bool:
+    return (
+        codepoint in (0x9, 0xA, 0xD)
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    )
+
+
+_NUMERIC_ENTITY_RE = re.compile(r"&#(x?)([0-9a-fA-F]+);")
+_XML_DECLARATION_RE = re.compile(rb"^\s*<\?xml[^>]*\?>\s*")
+
+
+def _strip_invalid_numeric_entities(text: str) -> str:
+    """Removes numeric character references (&#4; or &#x4;) that point at a
+    codepoint XML 1.0 doesn't allow at all -- these aren't meaningful
+    accounting data, just an artifact of whatever produced the export, so
+    dropping the reference entirely is equivalent to the stray control
+    character never having been there. A *valid* numeric reference (e.g.
+    &#8377; for the Rupee sign) is left untouched.
+    """
+    def _replace(m: "re.Match[str]") -> str:
+        codepoint = int(m.group(2), 16 if m.group(1) else 10)
+        return m.group(0) if _is_valid_xml_char(codepoint) else ""
+    return _NUMERIC_ENTITY_RE.sub(_replace, text)
+
+
+def _normalize_xml_encoding(xml_bytes: bytes) -> bytes:
+    """Real Tally exports are commonly UTF-16 with a BOM (confirmed against
+    real user files, 2026-08-06) rather than the UTF-8 every sample this
+    project had previously been tested against uses. Sniffs the BOM (UTF-16
+    LE/BE, or UTF-8) to decode correctly, strips any invalid numeric
+    character references (see _strip_invalid_numeric_entities), and
+    re-encodes everything to plain UTF-8 bytes with no leading BOM -- so the
+    rest of this module, and ElementTree/expat, only ever have to deal with
+    one encoding.
+
+    Re-encoding to UTF-8 ourselves (rather than relying on
+    ElementTree/expat's own BOM autodetection) also sidesteps a specific
+    hazard: the original file's <?xml ... encoding="UTF-16"?> declaration
+    would still be sitting at the top of the text after we've decoded it,
+    and now genuinely describes the WRONG encoding for the UTF-8 bytes we're
+    about to hand back -- expat trusts that declaration over the actual
+    bytes and misparses (or errors) as a result. Stripping the XML
+    declaration entirely avoids that: content with no declaration at all
+    defaults to UTF-8 per the XML spec, which is exactly what this function
+    just produced.
+    """
+    if xml_bytes.startswith(codecs.BOM_UTF16_LE):
+        text = xml_bytes[len(codecs.BOM_UTF16_LE):].decode("utf-16-le")
+    elif xml_bytes.startswith(codecs.BOM_UTF16_BE):
+        text = xml_bytes[len(codecs.BOM_UTF16_BE):].decode("utf-16-be")
+    elif xml_bytes.startswith(codecs.BOM_UTF8):
+        text = xml_bytes[len(codecs.BOM_UTF8):].decode("utf-8")
+    else:
+        try:
+            text = xml_bytes.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise TallyXmlParseError(
+                f"Could not decode file as UTF-8 or UTF-16 (checked for a byte-order mark of either): {e}"
+            ) from e
+
+    text = _strip_invalid_numeric_entities(text)
+    normalized = text.encode("utf-8")
+    return _XML_DECLARATION_RE.sub(b"", normalized, count=1)
+
+
+def _parse_envelope_root(xml_bytes: bytes) -> ET.Element:
+    """Normalizes encoding, parses the XML, and validates the root element
+    is <ENVELOPE> -- shared by parse_tally_xml_data (single, self-contained
+    file) and parse_tally_xml_fragment (one piece of a split export, see
+    "Split masters/transactions exports" below).
+    """
+    normalized = _normalize_xml_encoding(xml_bytes)
+    try:
+        root = ET.fromstring(normalized)
+    except ET.ParseError as e:
+        raise TallyXmlParseError(f"Not well-formed XML: {e}") from e
+
+    if root.tag != "ENVELOPE":
+        raise TallyXmlParseError(f"Expected root element <ENVELOPE>, found <{root.tag}> -- doesn't look like a Tally export.")
+
+    return root
 
 
 def _required_text(element: ET.Element, tag: str, context: str) -> str:
@@ -144,7 +263,13 @@ def _parse_tally_date(raw: str, context: str) -> str:
         raise TallyXmlParseError(f"{context}: could not parse '{raw}' as a Tally date (expected YYYYMMDD).") from e
 
 
-def _extract_ledger_masters(root: ET.Element) -> Dict[str, TallyLedgerMaster]:
+def _extract_ledger_masters_raw(root: ET.Element) -> Dict[str, TallyLedgerMaster]:
+    """The actual extraction, with no requirement that any <LEDGER> be
+    present -- a transactions-only fragment of a split export (see "Split
+    masters/transactions exports" below) legitimately has none.
+    _extract_ledger_masters wraps this with that requirement for the
+    single-combined-file case.
+    """
     masters: Dict[str, TallyLedgerMaster] = {}
     for ledger_el in root.iter("LEDGER"):
         name = ledger_el.get("NAME")
@@ -159,9 +284,13 @@ def _extract_ledger_masters(root: ET.Element) -> Dict[str, TallyLedgerMaster]:
 
         masters[name] = TallyLedgerMaster(name=name, parent=parent, opening_balance=opening_balance)
 
+    return masters
+
+
+def _extract_ledger_masters(root: ET.Element) -> Dict[str, TallyLedgerMaster]:
+    masters = _extract_ledger_masters_raw(root)
     if not masters:
         raise TallyXmlParseError("No <LEDGER> master elements found -- doesn't look like a Tally export.")
-
     return masters
 
 
@@ -189,7 +318,14 @@ def _extract_group_masters(root: ET.Element) -> Dict[str, TallyGroupMaster]:
     return groups
 
 
-def _extract_vouchers(root: ET.Element, known_ledger_names: Set[str]) -> List[TallyVoucher]:
+def _extract_vouchers(root: ET.Element, known_ledger_names: Optional[Set[str]]) -> List[TallyVoucher]:
+    """`known_ledger_names=None` skips the "references a ledger with no
+    matching master" check entirely -- used when parsing one fragment of a
+    split export (see parse_tally_xml_fragment), where a voucher's ledger
+    master may legitimately live in a DIFFERENT file not parsed yet. That
+    check is instead performed once, correctly, against the complete merged
+    ledger set by merge_tally_xml_fragments.
+    """
     vouchers: List[TallyVoucher] = []
 
     for voucher_el in root.iter("VOUCHER"):
@@ -205,7 +341,7 @@ def _extract_vouchers(root: ET.Element, known_ledger_names: Set[str]) -> List[Ta
         legs: List[TallyVoucherLeg] = []
         for entry in entries:
             ledger_name = _required_text(entry, "LEDGERNAME", f"Voucher '{vn}' ledger entry")
-            if ledger_name not in known_ledger_names:
+            if known_ledger_names is not None and ledger_name not in known_ledger_names:
                 raise TallyXmlParseError(f"Voucher '{vn}' references ledger '{ledger_name}', which has no matching <LEDGER> master.")
 
             deemed_raw = _required_text(entry, "ISDEEMEDPOSITIVE", f"Voucher '{vn}' entry for '{ledger_name}'")
@@ -245,17 +381,15 @@ def _extract_vouchers(root: ET.Element, known_ledger_names: Set[str]) -> List[Ta
 def parse_tally_xml_data(xml_bytes: bytes) -> TallyData:
     """Parses a raw Tally XML export into a TallyData -- every ledger master
     and every voucher, fully preserved. Takes raw bytes, not a decoded
-    string -- the file's own XML declaration states its encoding, and
-    ElementTree.fromstring rejects a str that also carries one.
+    string -- see _normalize_xml_encoding (real exports are commonly UTF-16
+    with a BOM, not UTF-8; ElementTree also rejects a str that still carries
+    its own encoding declaration). Requires the file to be a single,
+    self-contained export with both masters and vouchers (or masters alone)
+    -- for a real-world export split across separate masters-only and
+    transactions-only files, use parse_tally_xml_data_multi instead (see
+    "Split masters/transactions exports" below).
     """
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError as e:
-        raise TallyXmlParseError(f"Not well-formed XML: {e}") from e
-
-    if root.tag != "ENVELOPE":
-        raise TallyXmlParseError(f"Expected root element <ENVELOPE>, found <{root.tag}> -- doesn't look like a Tally export.")
-
+    root = _parse_envelope_root(xml_bytes)
     masters = _extract_ledger_masters(root)
     groups = _extract_group_masters(root)
     vouchers = _extract_vouchers(root, set(masters))
@@ -267,6 +401,104 @@ def parse_tally_xml_data_file(path: str) -> TallyData:
     OSError (e.g. FileNotFoundError) if the file can't be read, same as
     TrialBalance.from_csv."""
     return parse_tally_xml_data(Path(path).read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Split masters/transactions exports
+# ---------------------------------------------------------------------------
+# Confirmed against real user files (2026-08-06): Tally commonly exports a
+# company's data as two SEPARATE files -- one containing only <GROUP>/
+# <LEDGER> masters, another containing only <VOUCHER> entries -- rather than
+# one combined file. Both files' <REPORTNAME> can carry the same value
+# regardless of which kind of content is actually inside, so it is never
+# consulted here (or anywhere in this module) to decide anything; every
+# function below determines what a file contains purely by which elements
+# are actually present.
+def parse_tally_xml_fragment(xml_bytes: bytes) -> TallyData:
+    """Parses ONE file that may be only part of a split export: a
+    masters-only file (<GROUP>/<LEDGER>, no <VOUCHER> at all), a
+    transactions-only file (<VOUCHER> only, no <LEDGER>/<GROUP> at all), or
+    a single combined file with both -- content-driven, not decided from
+    <REPORTNAME> or any other label.
+
+    Unlike parse_tally_xml_data, this does NOT require at least one <LEDGER>
+    to be present (a transactions-only fragment legitimately has none), and
+    does NOT validate that a voucher leg's ledger has a matching master
+    WITHIN THIS FILE -- that master may live in a sibling fragment not
+    parsed yet. Both checks are instead performed once, correctly, by
+    merge_tally_xml_fragments below, against the complete merged dataset.
+
+    Not meant to be used standalone for a single all-in-one file where you
+    want those checks enforced immediately -- use parse_tally_xml_data for
+    that.
+    """
+    root = _parse_envelope_root(xml_bytes)
+    masters = _extract_ledger_masters_raw(root)
+    groups = _extract_group_masters(root)
+    vouchers = _extract_vouchers(root, known_ledger_names=None)
+    return TallyData(ledgers=masters, vouchers=vouchers, groups=groups)
+
+
+def merge_tally_xml_fragments(fragments: List[TallyData]) -> TallyData:
+    """Combines multiple TallyData fragments (see parse_tally_xml_fragment)
+    into one complete dataset, performing the same integrity checks
+    parse_tally_xml_data does for a single combined file, but now correctly
+    against the FULL merged picture: a voucher leg referencing a ledger
+    defined in a sibling fragment is exactly the normal case for a split
+    export, not an error -- it would only have been wrongly flagged if
+    validated one fragment at a time (which is exactly why
+    parse_tally_xml_fragment defers this check to here).
+    """
+    merged_ledgers: Dict[str, TallyLedgerMaster] = {}
+    merged_groups: Dict[str, TallyGroupMaster] = {}
+    merged_vouchers: List[TallyVoucher] = []
+
+    for fragment in fragments:
+        for name, master in fragment.ledgers.items():
+            if name in merged_ledgers:
+                raise TallyXmlParseError(
+                    f"Duplicate ledger master '{name}' across the uploaded files -- ambiguous which opening balance is authoritative."
+                )
+            merged_ledgers[name] = master
+
+        for name, group in fragment.groups.items():
+            if name in merged_groups:
+                raise TallyXmlParseError(
+                    f"Duplicate group master '{name}' across the uploaded files -- ambiguous which parent is authoritative."
+                )
+            merged_groups[name] = group
+
+        merged_vouchers.extend(fragment.vouchers)
+
+    if not merged_ledgers:
+        raise TallyXmlParseError(
+            "No <LEDGER> master elements found in any of the uploaded files -- doesn't look like a Tally export."
+        )
+
+    known_ledger_names = set(merged_ledgers)
+    for voucher in merged_vouchers:
+        for leg in voucher.legs:
+            if leg.ledger_name not in known_ledger_names:
+                raise TallyXmlParseError(
+                    f"Voucher '{voucher.voucher_number}' references ledger '{leg.ledger_name}', which has no "
+                    f"matching <LEDGER> master in any of the uploaded files."
+                )
+
+    return TallyData(ledgers=merged_ledgers, vouchers=merged_vouchers, groups=merged_groups)
+
+
+def parse_tally_xml_data_multi(files: List[bytes]) -> TallyData:
+    """Entry point for a real-world Tally export split across multiple
+    files (masters-only + transactions-only, in either order -- or any
+    other split, or even just one combined file, since merging a single
+    fragment is a no-op). Parses each of `files` as a fragment (see
+    parse_tally_xml_fragment) and merges them (see
+    merge_tally_xml_fragments).
+    """
+    if not files:
+        raise TallyXmlParseError("No files supplied to parse.")
+    fragments = [parse_tally_xml_fragment(f) for f in files]
+    return merge_tally_xml_fragments(fragments)
 
 
 def parse_tally_xml(xml_bytes: bytes) -> TrialBalance:

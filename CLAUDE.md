@@ -173,7 +173,10 @@ Implementation, so a future session can find the pieces:
   it's a standalone script, not part of `python3 -m unittest discover`).
   `test_api_manual.py` is the equivalent full-stack harness for `api.py` —
   also a standalone script (needs a running server), not part of
-  `unittest discover`.
+  `unittest discover`. `verify_large_split_utf16_files.py` (added
+  2026-08-06) is the same kind of standalone script, for
+  `tally_xml_parser.py`'s encoding/split-file handling at real-world scale
+  — see the `tally_xml_parser.py` bullet below.
 - `trial_balance_csv_parser.py` — tolerant CSV → `TrialBalance` parser used
   by `api.py`'s `/parse-trial-balance`, independent of and more lenient than
   `schemas/trial_balance.py`'s strict `TrialBalance.from_csv` (which stays
@@ -212,16 +215,52 @@ Implementation, so a future session can find the pieces:
   changed and stays CSV/stated-balance-focused. This is why the Tally
   pipeline's actually-validated check is `suspense_account_scrutiny.py`
   (below), not that one.
-  Unit tests: `tests/test_tally_xml_parser.py` (22 tests: sign-convention
-  math, P&L filtering, every rejection path, `TallyData` field/method
-  coverage).
+  **Encoding + split-file support** (added 2026-08-06, found testing
+  against real user Tally exports for the first time -- every sample used
+  before this was `data-synthesizer`'s own UTF-8, single-combined-file
+  output, which had been masking both gaps):
+  - Real exports are commonly **UTF-16 with a byte-order mark**, not UTF-8.
+    Every entry point takes raw bytes and sniffs the encoding itself via
+    `_normalize_xml_encoding` (BOM-based: UTF-16 LE/BE or UTF-8; falls back
+    to plain UTF-8 if no BOM, so every pre-existing sample still works
+    unchanged) and also strips numeric character references to codepoints
+    XML 1.0 doesn't allow at all (e.g. `&#4;`, also observed in real
+    exports) before handing anything to `ElementTree`.
+  - Real exports commonly arrive as **two separate files** -- one with only
+    `<GROUP>`/`<LEDGER>` masters, another with only `<VOUCHER>` entries --
+    rather than one combined file, and both can carry the same
+    `<REPORTNAME>` regardless of actual content (never trusted for
+    anything). `parse_tally_xml_fragment` parses one such file without
+    requiring ledgers to be present or validating voucher-ledger references
+    locally; `merge_tally_xml_fragments` combines multiple fragments and
+    performs those checks once, correctly, against the complete merged
+    picture; `parse_tally_xml_data_multi(files: List[bytes])` is the
+    combined entry point. `parse_tally_xml_data` (single file) is
+    unchanged/backward compatible -- still requires the file to be
+    self-contained.
+  Unit tests: `tests/test_tally_xml_parser.py` (48 tests: sign-convention
+  math, P&L filtering, group-hierarchy resolution, encoding normalization,
+  split-file merging, every rejection path, `TallyData` field/method
+  coverage). Real-world-scale regression check (standalone, not part of
+  `unittest discover` -- see below): `tests/verify_large_split_utf16_files.py`
+  generates a ~9MB UTF-16 masters file + ~61MB UTF-16 transactions file on
+  the fly (matching a real reported case exactly) with GST-specific noise
+  tags and invalid numeric entities scattered throughout, and asserts both
+  correctness (exact ledger/voucher counts, spot-checked balances, no
+  entity artifacts leaking into parsed text) and that parsing+merging
+  finishes in about a second, not minutes -- run with `python3
+  tests/verify_large_split_utf16_files.py` (`--quick` for a much smaller,
+  faster version during iteration). Also manually verified via a real HTTP
+  upload to a running `api.py` server (`/parse-tally-xml-multi`, both files
+  at once, ~70MB total) -- 200 OK in under 2 seconds; see "no request size
+  limit" note on that endpoint below.
 - A check module that imports sibling packages (i.e. any check built after
   the schemas/registry/coordinator layer landed) must be run as
   `python3 -m checks.<module_name> ...`, not as a bare script path — see
   the "CLI usage" note at the top of
   `checks/opening_balance_vs_prior_year_closing.py` for why.
 - `api.py` — minimal FastAPI service exposing checks over HTTP (see
-  "Conventions" exception above). Four endpoints so far:
+  "Conventions" exception above). Five endpoints so far:
   - `POST /run-checks` — wraps check #1 specifically (not a generic
     registry-driven dispatcher yet). Request body: `prior_year_trial_balance`
     and `current_year_trial_balance`, each `{"ledgers": [{"name", "group",
@@ -257,6 +296,24 @@ Implementation, so a future session can find the pieces:
     each, and the 4-error company's known phantom voucher (`JV-0012` on
     "Axis Bank CC A/c") round-trips through the endpoint with the exact
     same amount as `answer_key.json`. A non-XML file correctly returns 422.
+    Expects ONE self-contained file (masters + vouchers, or masters alone)
+    — see `/parse-tally-xml-multi` below for a real-world export split
+    across separate files.
+  - `POST /parse-tally-xml-multi` (added 2026-08-06) — same response shape
+    as `/parse-tally-xml`, but takes MULTIPLE files (multipart/form-data,
+    repeated field name `files`) and merges them via
+    `tally_xml_parser.py`'s `parse_tally_xml_data_multi` — for a real-world
+    export split across a masters-only file and a transactions-only file
+    (see the `tally_xml_parser.py` bullet above). Which file is which is
+    never assumed from filename or `<REPORTNAME>` — content alone decides,
+    and file order doesn't matter. **No request size limit was hit or
+    added** — checked this Starlette version's multipart parser source
+    (`max_part_size`/`spool_max_size`, both 1MB) and confirmed by reading it
+    that the 1MB cap applies only to plain form *fields*, not file uploads
+    (files stream through a `SpooledTemporaryFile` with no size cap at all);
+    confirmed empirically too, with a real HTTP POST of two real-world-scale
+    UTF-16 files (~9MB + ~61MB, ~70MB total request) to a running server —
+    200 OK in under 2 seconds, not rejected.
   - `POST /run-suspense-check` (added 2026-08-02) — wraps
     `checks/suspense_account_scrutiny.py` specifically (same one-check-per-
     endpoint approach as `/run-checks`, not a registry-driven dispatcher).

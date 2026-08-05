@@ -24,7 +24,19 @@ Endpoints:
   ({"ledgers": [...], "vouchers": [...], "groups": [...]}) preprocessing step
   (see tally_xml_parser.py). "groups" is only the company's own custom
   <GROUP> masters (may be empty) -- see schemas/tally_data.py's
-  TallyGroupMaster/resolve_top_level_group for why.
+  TallyGroupMaster/resolve_top_level_group for why. Expects ONE
+  self-contained file with both masters and vouchers (or masters alone) --
+  for a real-world export split across separate masters-only and
+  transactions-only files, use /parse-tally-xml-multi instead.
+- POST /parse-tally-xml-multi, the same preprocessing step but for MULTIPLE
+  Tally XML files merged into one TallyData (same response shape as
+  /parse-tally-xml) -- confirmed against real user files (2026-08-06),
+  Tally commonly splits a company's export into a masters-only file and a
+  transactions-only file rather than one combined file, and a
+  transactions-only file has no <LEDGER> masters of its own for
+  /parse-tally-xml to validate against. See tally_xml_parser.py's "Split
+  masters/transactions exports" for the merge logic and why <REPORTNAME> is
+  never trusted to tell the two files apart.
 - POST /run-suspense-check, wrapping checks/suspense_account_scrutiny.py
   specifically (same one-check-per-endpoint approach as /run-checks, not a
   registry-driven dispatcher). Takes the same TallyData shape
@@ -44,7 +56,7 @@ from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_
 from checks.suspense_account_scrutiny import run_check as run_suspense_account_scrutiny
 from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
-from tally_xml_parser import TallyXmlParseError, parse_tally_xml_data
+from tally_xml_parser import TallyXmlParseError, parse_tally_xml_data, parse_tally_xml_data_multi
 from trial_balance_csv_parser import TrialBalanceParseError, parse_trial_balance_csv
 
 app = FastAPI(
@@ -204,22 +216,11 @@ def run_suspense_check(request: TallyDataIn) -> List[dict]:
     return [r.to_dict() for r in results]
 
 
-@app.post("/parse-tally-xml")
-async def parse_tally_xml(file: UploadFile = File(...)) -> dict:
-    """Parses an uploaded Tally XML export into the full structured
-    TallyData shape -- every ledger master (name, parent, opening_balance)
-    and every voucher (voucher_number, date, narration, legs), not just a
-    collapsed trial balance. debit/credit-equivalent amounts are returned as
-    strings, same Decimal-precision reasoning as /parse-trial-balance. Takes
-    raw bytes from the upload directly (no text-decode step) -- Tally XML
-    declares its own encoding, see tally_xml_parser.py's module docstring.
+def _tally_data_to_response(tally_data: TallyData) -> dict:
+    """Shared response shape for /parse-tally-xml and /parse-tally-xml-multi
+    -- debit/credit-equivalent amounts are returned as strings, same
+    Decimal-precision reasoning as /parse-trial-balance.
     """
-    raw = await file.read()
-    try:
-        tally_data = parse_tally_xml_data(raw)
-    except TallyXmlParseError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
     return {
         "ledgers": [
             {"name": m.name, "parent": m.parent, "opening_balance": str(m.opening_balance)}
@@ -243,3 +244,44 @@ async def parse_tally_xml(file: UploadFile = File(...)) -> dict:
             for g in tally_data.groups.values()
         ],
     }
+
+
+@app.post("/parse-tally-xml")
+async def parse_tally_xml(file: UploadFile = File(...)) -> dict:
+    """Parses an uploaded Tally XML export into the full structured
+    TallyData shape -- every ledger master (name, parent, opening_balance)
+    and every voucher (voucher_number, date, narration, legs), not just a
+    collapsed trial balance. Takes raw bytes from the upload directly (no
+    text-decode step) -- tally_xml_parser.py sniffs the encoding itself
+    (real exports are commonly UTF-16 with a BOM, not UTF-8).
+    """
+    raw = await file.read()
+    try:
+        tally_data = parse_tally_xml_data(raw)
+    except TallyXmlParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return _tally_data_to_response(tally_data)
+
+
+@app.post("/parse-tally-xml-multi")
+async def parse_tally_xml_multi(files: List[UploadFile] = File(...)) -> dict:
+    """Parses and merges MULTIPLE Tally XML files into one structured
+    TallyData -- for a real-world export split across a masters-only file
+    (<GROUP>/<LEDGER>) and a transactions-only file (<VOUCHER>), which
+    /parse-tally-xml (single file) can't accept since a transactions-only
+    file has no <LEDGER> masters of its own. Which file is "masters" vs
+    "transactions" is never assumed from filename or <REPORTNAME> (both can
+    carry the same value regardless of actual content) -- content alone
+    (which elements are actually present) determines what each file
+    contributes, and the files can be supplied in any order. Same response
+    shape as /parse-tally-xml. See tally_xml_parser.py's
+    parse_tally_xml_data_multi / "Split masters/transactions exports".
+    """
+    raw_files = [await f.read() for f in files]
+    try:
+        tally_data = parse_tally_xml_data_multi(raw_files)
+    except TallyXmlParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return _tally_data_to_response(tally_data)
