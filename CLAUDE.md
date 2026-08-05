@@ -241,13 +241,17 @@ Implementation, so a future session can find the pieces:
     over the WHOLE document (encoding normalization happens before any
     per-element parsing, so there's no way to scope it to one tag, and an
     illegal literal character anywhere breaks well-formedness for the whole
-    file regardless of which field it's in) — **flagged, not yet confirmed
-    either way against real data**: if this same delimiter pattern ever
-    shows up inside a field this project actually reads (`NARRATION`,
-    `LEDGERNAME`), stripping would silently concatenate that field's joined
-    sub-values with no separator, losing real information rather than
-    discarding noise. Worth specifically checking those two fields if a
-    future real file trips this path.
+    file regardless of which field it's in) — a real risk in principle,
+    since if this same delimiter pattern showed up inside a field this
+    project actually reads, stripping would silently concatenate that
+    field's joined sub-values with no separator, losing real information
+    rather than discarding noise. **Confirmed clean against real client
+    data (2026-08-07):** every occurrence of the raw control-character
+    delimiter pattern in the real ~61MB `Transactions.xml` was checked, and
+    it appears ONLY in `STATKEY` — `NARRATION`, `LEDGERNAME`, `PARTYNAME`,
+    and `VOUCHERNUMBER` are all clean. Not a structural guarantee (a
+    different real export could still differ), but confirmed against the
+    one real file this was found in.
   - Real exports commonly arrive as **two separate files** -- one with only
     `<GROUP>`/`<LEDGER>` masters, another with only `<VOUCHER>` entries --
     rather than one combined file, and both can carry the same

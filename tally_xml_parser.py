@@ -224,13 +224,16 @@ def _strip_raw_illegal_control_chars(text: str) -> str:
     isn't possible at this stage even if it were desirable. STATKEY's
     content isn't consumed by any check this project runs today, so
     stripping delimiter characters out of it is harmless -- it was already
-    effectively discarded either way. CAVEAT (unconfirmed either way against
-    real data, flagging rather than guessing): if this same delimiter
-    pattern ever shows up inside a field this project DOES read, e.g.
-    NARRATION or LEDGERNAME, stripping the delimiter would silently
-    concatenate that field's joined sub-values with no separator between
-    them, rather than just discarding noise -- worth specifically checking
-    NARRATION/LEDGERNAME content if a future real file trips this path.
+    effectively discarded either way. CONFIRMED CLEAN against real client
+    data (2026-08-07): every occurrence of this delimiter pattern in the
+    real ~61MB Transactions.xml this was found in was checked, and it
+    appears ONLY in STATKEY -- NARRATION, LEDGERNAME, PARTYNAME, and
+    VOUCHERNUMBER are all clean of it. Not a structural guarantee (a
+    different real export could still differ, in which case stripping the
+    delimiter would silently concatenate that field's joined sub-values
+    with no separator, losing real information rather than discarding
+    noise) -- but confirmed clean against the one real file this was found
+    in.
     """
     return text.translate(_ILLEGAL_XML_CHAR_TRANSLATION)
 
