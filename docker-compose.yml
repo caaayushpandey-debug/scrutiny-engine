@@ -1,0 +1,35 @@
+# Written for future portability / CI, matching scrutiny-engine-frontend's
+# "free, local, no cloud dependency" convention for its own Firebase
+# emulator setup -- see that project's CLAUDE.md.
+#
+# NOT what local dev on this machine actually runs against today: this repo
+# was developed against a native Homebrew Postgres (`brew install
+# postgresql@16`, see CLAUDE.md's "Postgres data layer" > "Local setup")
+# because Docker wasn't installed here when this branch started. Both target
+# the exact same db/schema.sql, so either path produces an identical schema
+# -- use whichever is available in a given environment.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose exec -T postgres psql -U postgres -d scrutiny_engine -f - < db/schema.sql
+#   (or mount db/schema.sql and have Postgres auto-run it on first boot --
+#   see the volumes entry below, which does exactly that)
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: scrutiny_engine
+      POSTGRES_USER: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - scrutiny_engine_pgdata:/var/lib/postgresql/data
+      # Postgres's official image auto-runs every .sql file in this
+      # directory, in filename order, on first container start (empty data
+      # dir only) -- same effect as manually running `psql -f db/schema.sql`
+      # against the native install.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+
+volumes:
+  scrutiny_engine_pgdata:

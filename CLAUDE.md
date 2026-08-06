@@ -267,10 +267,15 @@ someone bypasses the application). Mechanism:
   unconditionally, without needing `FORCE` at all.
 - Every table has `ROW LEVEL SECURITY` enabled and one policy:
   `USING (client_id = current_setting('app.current_client_id', true))`.
-- The data access layer issues `SET LOCAL app.current_client_id = <id>`
-  as the first statement of every transaction, scoped to that transaction
-  only (`SET LOCAL`, not `SET`) so a pooled/reused connection can never leak
-  one request's client scope into the next. If that session variable is
+- The data access layer issues `SELECT set_config('app.current_client_id',
+  <id>, true)` as the first statement of every transaction, scoped to that
+  transaction only (the third `set_config` argument, `is_local`, gives the
+  same transaction-only scoping `SET LOCAL` would -- `set_config()` is used
+  instead of a literal `SET LOCAL ... = <id>` specifically because `SET` is
+  a utility statement that doesn't accept a bind parameter for its value;
+  `set_config()` is a normal function call that does) so a pooled/reused
+  connection can never leak one request's client scope into the next. If
+  that session variable is
   unset, `current_setting(..., true)` returns `NULL`, and `client_id = NULL`
   is never true for any real row — so a caller that forgets to scope a
   connection gets zero rows back, not another client's data.
