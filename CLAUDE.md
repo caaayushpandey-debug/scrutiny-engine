@@ -618,6 +618,21 @@ without crashing.
     them), and every existing raw-payload call
     (`tests/test_api_manual.py`) still passes unmodified against the live
     server.
+  - `POST /store-trial-balance` (added 2026-08-06, `feature/postgres-data-layer`)
+    — persists an already-parsed `TrialBalance` into Postgres, keyed by
+    `client_id` + `fy` + `scope` (`version_scoped` or
+    `period_scoped_prior_year`) `[+ version_id]`, so a later `/run-checks`
+    reference-mode call can read it back. A separate step from both parsing
+    and running the check — the browser has no way to write to Postgres
+    directly (no client-side driver, unlike Firestore's own client SDK), so
+    this endpoint is that write path. Upserts (safe to call again for the
+    same version/scope — a corrected upload just overwrites the prior rows).
+    Any database-layer failure returns 503, not a generic 500. Verified live
+    with a brand-new `client_id`: `/parse-trial-balance` → `/store-trial-balance`
+    → `/run-checks` (reference mode) produces results byte-for-byte identical
+    to the existing payload-mode path for the same files, and a second
+    identical store call reports the same `stored_ledgers` count (confirmed
+    idempotent, not duplicating rows).
   - `POST /parse-trial-balance` — raw CSV file upload (multipart/form-data,
     field name `file`) → the same `{"ledgers": [...]}` shape `/run-checks`
     consumes (debit/credit returned as strings, same precision reasoning).
@@ -739,6 +754,15 @@ without crashing.
     `tally_export.xml` uploaded through `/parse-tally-xml` (same 2 flagged
     postings, same amounts), and a nonexistent client_id returns a normal
     200 with `status="insufficient_data"`, not an HTTP error.
+  - `POST /store-tally-data` (added 2026-08-06, `feature/postgres-data-layer`)
+    — the `tally_data` counterpart to `/store-trial-balance` above: persists
+    an already-parsed `TallyData` into Postgres, keyed by `client_id` + `fy`
+    + `version_id` (always required — `TALLY_DATA` has no prior-year
+    scope). Verified live the same way: `/parse-tally-xml` →
+    `/store-tally-data` → `/run-suspense-check` (reference mode) produces
+    results byte-for-byte identical to the payload-mode path, and a second
+    identical store call reports the same `stored_ledgers`/`stored_vouchers`
+    counts.
   - `GET /health` for a basic liveness check. Auto-generated interactive docs
     at `/docs` once running.
   Run locally: `./venv/bin/uvicorn api:app --reload --port 8000`.
