@@ -144,6 +144,250 @@ Implementation, so a future session can find the pieces:
   documents or execute checks; that's each check's own `run_check`/
   `run_check_from_files`.
 
+## Postgres data layer (design, added 2026-08-06 — schema/rationale written before any code, per explicit instruction)
+Every check so far (`opening_balance_vs_prior_year_closing.py`,
+`suspense_account_scrutiny.py`) takes its input as an already-parsed
+in-memory `TrialBalance`/`TallyData` object, loaded straight from a raw CSV
+or Tally XML file passed on the CLI or over `/run-checks`/`/run-suspense-check`.
+That's fine for validating a check's logic against `data-synthesizer` output,
+but there's no persisted, queryable store of a client's financial data across
+FYs/versions — this section designs one, on `feature/postgres-data-layer`,
+worked out and documented here **before** any table or Python code exists.
+
+### Why Postgres, and why now
+The frontend (`scrutiny-engine-frontend`) already persists client/version/FY
+metadata in Firestore, but the actual parsed financial data
+(`ParsedFileData`, e.g. Tally ledgers/vouchers) only ever lives as a JSON
+blob attached to a file's metadata — there's no relational store a check can
+query by `(client_id, fy, version_id)` without the frontend re-shipping the
+whole blob over HTTP every time. Postgres is introduced here, in this
+project, as that queryable store for the checks that need one — a relational
+database is the right fit specifically because every document type here has
+a natural tabular shape (rows of ledgers, rows of voucher legs) and because
+Postgres Row-Level Security (see below) gives a second, database-enforced
+tenant-isolation guarantee that a JSON blob store can't. This does not
+replace Firestore for the frontend's own client/version/audit-trail
+bookkeeping — see that project's CLAUDE.md — it is a new store scoped to
+this project's own document data.
+
+### Scope: which document types get tables now
+Per HARD RULE #7's three document types already in `schemas/`, this first
+pass only covers the two document types that have a real, validated check
+consuming them today (`opening_balance_vs_prior_year_closing.py` needs
+`TrialBalance`; `suspense_account_scrutiny.py` needs `TallyData`) — the eight
+placeholder schemas (`gstr1.py`, `bank_statement.py`, etc.) get tables when
+the first check that actually consumes them is built, not speculatively now.
+
+### Tables
+One table per dataclass in `schemas/trial_balance.py` and
+`schemas/tally_data.py`, not one table per document type — `TallyData`
+itself has three levels of nested structure (ledger masters, vouchers,
+voucher legs) that don't collapse into a single table without either
+duplicating leg rows across ledgers or losing per-leg detail, so it becomes
+three tables. Every table carries `client_id`, `fy`, and `version_id`
+(`TEXT`, matching the frontend's own id shapes — Firestore doc ids and
+`V1`/`V2`-style version labels, not integers) so a check's data access
+call can filter to exactly the scope it needs, and every table has a
+composite `(client_id, fy)` index at minimum (see "Indexes" below) since
+that's the coordinator's own `AvailableDocuments` granularity (see "Document
+scope model" above) and the shape every data-access function's WHERE clause
+uses.
+
+- **`trial_balance_ledgers`** — `schemas/trial_balance.py`'s `LedgerBalance`.
+  One row per ledger. Also carries a `scope` column
+  (`'version_scoped'` | `'period_scoped_prior_year'`) because `TrialBalance`
+  is the one document type used in two different scope roles (see "Document
+  scope model" above) — a prior-year closing balance and a current-year
+  opening balance for the same client/FY/ledger name are two distinct rows,
+  not one. `version_id` is `NOT NULL` when `scope = 'version_scoped'` and
+  `NULL` when `scope = 'period_scoped_prior_year'` (enforced by a `CHECK`
+  constraint) — a prior-year closing balance is uploaded once per FY, not
+  per version, matching `AvailableDocuments.period_scoped_documents` in
+  `coordinator.py`.
+- **`tally_ledgers`** — `schemas/tally_data.py`'s `TallyLedgerMaster`. One
+  row per ledger master. `TALLY_DATA` has no prior-year role (see
+  `schemas/enums.py`'s `DEFAULT_SCOPE_BY_DOCUMENT_TYPE` docstring), so
+  `version_id` is always `NOT NULL` here — no scope column needed.
+- **`tally_vouchers`** — `schemas/tally_data.py`'s `TallyVoucher`, minus
+  `legs` (its own table below). One row per voucher.
+- **`tally_voucher_legs`** — `schemas/tally_data.py`'s `TallyVoucherLeg`.
+  One row per leg, foreign-keyed to `tally_vouchers.id`
+  (`ON DELETE CASCADE`), but **also** carries its own denormalized
+  `client_id`/`fy`/`version_id` rather than relying on a join up to
+  `tally_vouchers` for those — this is deliberate, not an oversight: the RLS
+  policy below (per-table `client_id` filter) needs a column to filter on
+  directly, and a policy that required joining to a parent table to
+  determine visibility would be both slower and a weaker guarantee (the join
+  path itself becomes something a future schema change could accidentally
+  break). `leg_order` (int) preserves the original leg order within a
+  voucher, since `dataclass` field order in `TallyVoucher.legs` currently
+  carries no explicit sequence number.
+
+Custom Tally group masters (`schemas/tally_data.py`'s `TallyGroupMaster`,
+used by the frontend's `TallyDataVisualizer.tsx` group-hierarchy walk, see
+`scrutiny-engine-frontend`'s CLAUDE.md) are **not** given a table in this
+pass — no check here reads `TallyData.groups` today (only
+`resolve_top_level_group`, which is frontend/visualizer-only classification
+logic, not a check). Add `tally_groups` when a check needs it.
+
+### Indexes
+Every table gets a composite `(client_id, fy)` btree index (the coordinator/
+data-access query shape) plus a uniqueness constraint preventing the same
+logical row from being loaded twice:
+- `trial_balance_ledgers`: two **partial** unique indexes (not one plain
+  `UNIQUE` including `version_id`), because `version_id` is `NULL` for every
+  `period_scoped_prior_year` row and Postgres treats `NULL <> NULL` in a
+  unique index — a plain `UNIQUE(client_id, fy, version_id, ledger_name)`
+  would silently allow duplicate prior-year rows for the same ledger. Split
+  into `UNIQUE (client_id, fy, version_id, ledger_name) WHERE scope =
+  'version_scoped'` and `UNIQUE (client_id, fy, ledger_name) WHERE scope =
+  'period_scoped_prior_year'` instead.
+- `tally_ledgers`: `UNIQUE (client_id, fy, version_id, ledger_name)`.
+- `tally_vouchers`: `UNIQUE (client_id, fy, version_id, voucher_number)` —
+  matches how checks already key a voucher (`suspense_account_scrutiny.py`'s
+  `SourceReference.voucher_number`, and every `data-synthesizer` answer key's
+  `phantom_voucher_number`).
+- `tally_voucher_legs`: no uniqueness constraint beyond the `voucher_id` FK
+  — a voucher can legitimately have two legs against the same ledger (e.g.
+  two separate debit postings to the same ledger within one voucher), so
+  there is no natural leg-level unique key beyond the surrogate `id`.
+
+### Row-Level Security (second enforcement layer)
+Postgres RLS is added on top of the data access layer's own
+`WHERE client_id = ...` filtering (defense in depth — see
+`scrutiny-engine-frontend`'s CLAUDE.md "wide open Firestore rules" item for
+what happens when application-level filtering is the *only* layer and
+someone bypasses the application). Mechanism:
+- A dedicated, non-superuser, non-table-owning Postgres role
+  (`scrutiny_app`) is what the data access layer connects as — migrations/
+  DDL run as the owning role instead. This matters because RLS is silently
+  bypassed for a table's owner and for superusers unless
+  `FORCE ROW LEVEL SECURITY` is also set; using a separate, lower-privilege
+  role for all application queries means the policies below apply
+  unconditionally, without needing `FORCE` at all.
+- Every table has `ROW LEVEL SECURITY` enabled and one policy:
+  `USING (client_id = current_setting('app.current_client_id', true))`.
+- The data access layer issues `SET LOCAL app.current_client_id = <id>`
+  as the first statement of every transaction, scoped to that transaction
+  only (`SET LOCAL`, not `SET`) so a pooled/reused connection can never leak
+  one request's client scope into the next. If that session variable is
+  unset, `current_setting(..., true)` returns `NULL`, and `client_id = NULL`
+  is never true for any real row — so a caller that forgets to scope a
+  connection gets zero rows back, not another client's data.
+- This is a second, database-enforced layer specifically so that a bug in
+  the data access layer's own `WHERE` clause (or, later, a hypothetical
+  direct query that bypasses the data access layer despite the "only code
+  allowed to query these tables directly" rule) fails closed rather than
+  leaking cross-client data.
+
+### Local setup (no cloud dependency, matching the frontend's Firebase
+emulator approach)
+Originally planned as Docker (matching `scrutiny-engine-frontend`'s "free,
+local, no cloud dependency" emulator convention), but this machine had
+neither Docker nor Homebrew installed when this branch started — the user
+chose to install Homebrew and run Postgres natively via `brew services`
+instead of blocking on a Docker Desktop install
+(`docker-compose.yml` is still written and kept in the repo for future
+portability/CI, just not what local dev actually runs against today):
+1. `brew install postgresql@16`, then `brew services start postgresql@16`
+   (registers it as a login-item background service — survives reboots,
+   matches how the frontend's Firebase emulators are a separate
+   long-running local process alongside `npm run dev`).
+2. `createdb scrutiny_engine` (one-time, run as the Homebrew-installed
+   admin role — on macOS this is your own macOS username by default, no
+   password needed for local trust-auth connections).
+3. `psql -d scrutiny_engine -f db/schema.sql` — creates all four tables,
+   indexes, the `scrutiny_app` role, and RLS policies. Idempotent-ish (uses
+   `CREATE TABLE IF NOT EXISTS` / `DO $$ ... EXCEPTION WHEN duplicate_object`
+   guards for the role) so it's safe to re-run.
+4. `./venv/bin/pip install -r requirements.txt` — adds `psycopg[binary]` as
+   a new dependency (see "Conventions" — this is the same kind of deliberate
+   exception `api.py`'s FastAPI dependency already is: talking to a real
+   network service, here Postgres instead of HTTP, isn't something to
+   hand-roll on stdlib `socket`). Every check module itself stays
+   stdlib-only; only `db/connection.py` and `db/queries.py` import
+   `psycopg`.
+5. `python3 -m db.load_sample_data` — one-time loader populating
+   `scrutiny_engine` from the sibling `data-synthesizer` repo's existing
+   sample output (`samples/trial_balance/*` and `samples/tally_xml/*`), so
+   the migrated checks have real, answer-key-backed data to read for HARD
+   RULE #4 verification. See `db/load_sample_data.py`'s own docstring for
+   the `client_id`/`fy`/`version_id` values it assigns to each sample
+   company (there's no real client/FY/version registry in this project yet
+   — that lives in the frontend's Firestore, which this loader does not
+   read from).
+Connection string: `postgresql://localhost/scrutiny_engine` for the owning/
+migration role (peer/trust auth, no password, standard for a native
+Homebrew Postgres on macOS); the app role's own DSN is
+`postgresql://scrutiny_app@localhost/scrutiny_engine` (also no password
+locally — see `db/schema.sql`'s role creation for the exact grant; a real
+password/`.pgpass`/env-var secret would be needed before this ever runs
+against a shared, non-local Postgres instance, which is out of scope for
+this local-only pass).
+
+### Data access layer (`db/`)
+`db/connection.py` and `db/queries.py` are the **only** code in this project
+allowed to issue a SQL query against these tables — every check keeps
+consuming plain `TrialBalance`/`TallyData` objects exactly as before (see
+"Migrating the checks" below), never a `psycopg` cursor or raw SQL string.
+- `db/connection.py` — `client_scoped_connection(client_id)`, a context
+  manager that opens a connection as `scrutiny_app`, issues
+  `SET LOCAL app.current_client_id = <id>` inside a transaction, yields a
+  cursor, and commits/rolls back on exit. This is the one place
+  `SET LOCAL app.current_client_id` is ever issued.
+- `db/queries.py` — one function per table/document type, per the task's
+  own naming: `get_trial_balance(client_id, fy, scope, version_id=None) ->
+  TrialBalance`, `get_tally_ledgers(client_id, fy, version_id) ->
+  Dict[str, TallyLedgerMaster]`, `get_tally_vouchers(client_id, fy,
+  version_id) -> List[TallyVoucher]` (assembles legs via a second query
+  keyed on the fetched voucher ids, ordered by `leg_order`), and
+  `get_tally_data(client_id, fy, version_id) -> TallyData` (a thin composer
+  calling the previous two and assembling the dataclass checks actually
+  need — still doesn't issue SQL directly itself, so the "only these two
+  modules query the tables" rule holds). Every function returns the exact
+  same dataclasses `schemas/` already defines — a check migrated onto this
+  layer gets back the identical object shape it got from
+  `TrialBalance.from_csv`/`parse_tally_xml_data_file` before.
+
+### Migrating the checks (input source swap only, logic unchanged)
+Per explicit instruction, `run_check()` in both
+`opening_balance_vs_prior_year_closing.py` and
+`suspense_account_scrutiny.py` is **not modified at all** — both already
+take plain `TrialBalance`/`TallyData` objects and have no idea whether that
+object came from a CSV file, an XML file, or a database row. Only each
+check's *loading* wrapper changes:
+- `run_check_from_files(prior_year_csv_path, current_year_csv_path, ...)`
+  gains a sibling, `run_check_from_db(client_id, fy, version_id,
+  tolerance=...)`, calling `db.queries.get_trial_balance` twice (once per
+  scope) instead of `TrialBalance.from_csv` twice, then calling the
+  unchanged `run_check`. Same `insufficient_data` handling on failure,
+  translated from a `psycopg` error / empty-result case instead of
+  `OSError`/`ValueError`.
+- `run_check_from_file(tally_xml_path)` gains a sibling,
+  `run_check_from_db(client_id, fy, version_id)`, calling
+  `db.queries.get_tally_data` instead of `parse_tally_xml_data_file`, then
+  calling the unchanged `run_check`.
+- The existing file-based entry points (`run_check_from_files`,
+  `run_check_from_file`) are **not removed** — `api.py`'s existing
+  `/run-checks`/`/run-suspense-check` endpoints and the CLI `main()`
+  functions keep working exactly as before; this only adds a new,
+  additional way to run each check. Wiring `api.py` itself to call the new
+  `_from_db` entry points is explicitly out of scope for this pass (see
+  the user's own "before we touch the frontend/API layer" instruction) —
+  it stays purely file-based for now.
+
+### Verification (HARD RULE #4, re-applied for the new input source)
+`db/load_sample_data.py` loads every `data-synthesizer` sample company
+(both `samples/trial_balance/*` and `samples/tally_xml/*`) into
+`scrutiny_engine`, then `tests/verify_against_data_synthesizer_via_db.py`
+and `tests/verify_suspense_account_scrutiny_against_data_synthesizer_via_db.py`
+re-run the exact same answer-key assertions as the original two
+`verify_*_against_data_synthesizer.py` scripts, but call each check's new
+`run_check_from_db` instead of loading files directly — proving the
+Postgres-sourced path produces byte-for-byte (well, paisa-for-paisa)
+identical results to the original file-sourced path, not just that it runs
+without crashing.
+
 ## Structure (update as it grows)
 - `schemas/` — one module per document type, each independently importable.
   `schemas/trial_balance.py` (`LedgerBalance`, `TrialBalance`) and
