@@ -797,6 +797,17 @@ or try to make one supersede the other.
   (`version_scoped`). CSV/`TrialBalance`-only — deliberately NOT run against
   Tally XML's voucher-derived data; see `tally_xml_parser.py`'s "KNOWN
   LIMITATION" entry above for why that combination doesn't make sense.
+  Gained a `run_check_from_db(client_id, fy, version_id, tolerance=...)`
+  entry point (2026-08-06, `feature/postgres-data-layer`) sourcing both
+  `TrialBalance` documents from Postgres via `db/queries.get_trial_balance`
+  instead of CSV files — `run_check()` itself untouched. Re-validated via
+  `tests/verify_against_data_synthesizer_via_db.py` against the same 5
+  sample companies (loaded into Postgres by `db/load_sample_data.py`):
+  identical PASS result to the file-sourced harness, same amounts to the
+  paisa. `run_check_from_files` is unchanged and still the entry point
+  `api.py`'s `/run-checks` and the CLI `main()` use — see CLAUDE.md's
+  "Postgres data layer" section for why `api.py` wasn't touched in this
+  pass.
 - `suspense_account_scrutiny.py` (added 2026-08-02) — **FINAL.** Consumes
   `TallyData` (ledger masters + vouchers) directly, not `TrialBalance` — no
   prior-year document needed, since it only reasons about postings within
@@ -816,4 +827,11 @@ or try to make one supersede the other.
   every flagged result. Declares one `DataRequirement`: current-year Tally
   data (`version_scoped`). Unit tests:
   `tests/test_suspense_account_scrutiny.py` (7 tests, hand-built `TallyData`
-  fixtures).
+  fixtures). Gained a `run_check_from_db(client_id, fy, version_id)` entry
+  point (2026-08-06, `feature/postgres-data-layer`) sourcing `TallyData`
+  from Postgres via `db/queries.get_tally_data` instead of parsing
+  `tally_export.xml` — `run_check()` itself untouched. Re-validated via
+  `tests/verify_suspense_account_scrutiny_against_data_synthesizer_via_db.py`
+  against the same 5 sample companies: identical PASS result to the
+  file-sourced harness. `run_check_from_file` is unchanged and still what
+  `api.py`'s `/run-suspense-check` and the CLI `main()` use.

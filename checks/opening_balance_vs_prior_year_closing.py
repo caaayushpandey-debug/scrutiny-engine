@@ -307,6 +307,76 @@ def run_check(
     return results
 
 
+def run_check_from_db(
+    client_id: str,
+    fy: str,
+    version_id: str,
+    tolerance: Decimal = DEFAULT_TOLERANCE,
+) -> List[CheckResult]:
+    """Same as run_check_from_files, but loads both TrialBalance documents
+    from Postgres via db/queries.py instead of CSV files (see CLAUDE.md's
+    "Postgres data layer" section, "Migrating the checks" subsection).
+    run_check() itself is completely unchanged -- this function only swaps
+    the input source. Returns a single status="insufficient_data" result
+    (same contract as run_check_from_files) if either side has no ledgers
+    stored yet, or if the database itself can't be reached -- both mean
+    "the check cannot run", the same class of failure a missing/unreadable
+    CSV file would be.
+    """
+    # Imported lazily so importing this check module doesn't require
+    # psycopg to be installed unless run_check_from_db is actually called --
+    # every other entry point (run_check, run_check_from_files, main) stays
+    # usable with no Postgres dependency at all.
+    import psycopg
+
+    from db.queries import get_trial_balance
+    from schemas.enums import DocumentScope
+
+    try:
+        prior_tb = get_trial_balance(client_id, fy, DocumentScope.PERIOD_SCOPED_PRIOR_YEAR)
+    except psycopg.Error as e:
+        return [CheckResult(
+            check_id=CHECK_ID,
+            status="insufficient_data",
+            confidence_score=1.0,
+            description=f"Could not load prior year closing trial balance from the database for client '{client_id}', FY {fy}: {e}",
+            amount=None,
+            source_reference=SourceReference(),
+        )]
+    if not prior_tb.ledgers:
+        return [CheckResult(
+            check_id=CHECK_ID,
+            status="insufficient_data",
+            confidence_score=1.0,
+            description=f"No prior year closing trial balance found in the database for client '{client_id}', FY {fy}.",
+            amount=None,
+            source_reference=SourceReference(),
+        )]
+
+    try:
+        current_tb = get_trial_balance(client_id, fy, DocumentScope.VERSION_SCOPED, version_id=version_id)
+    except psycopg.Error as e:
+        return [CheckResult(
+            check_id=CHECK_ID,
+            status="insufficient_data",
+            confidence_score=1.0,
+            description=f"Could not load current year opening trial balance from the database for client '{client_id}', FY {fy}, version '{version_id}': {e}",
+            amount=None,
+            source_reference=SourceReference(),
+        )]
+    if not current_tb.ledgers:
+        return [CheckResult(
+            check_id=CHECK_ID,
+            status="insufficient_data",
+            confidence_score=1.0,
+            description=f"No current year opening trial balance found in the database for client '{client_id}', FY {fy}, version '{version_id}'.",
+            amount=None,
+            source_reference=SourceReference(),
+        )]
+
+    return run_check(prior_tb, current_tb, tolerance=tolerance)
+
+
 def run_check_from_files(
     prior_year_csv_path: str,
     current_year_csv_path: str,

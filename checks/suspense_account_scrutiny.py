@@ -191,6 +191,51 @@ def run_check(tally_data: TallyData) -> List[CheckResult]:
     return results
 
 
+def run_check_from_db(client_id: str, fy: str, version_id: str) -> List[CheckResult]:
+    """Same as run_check_from_file, but loads TallyData from Postgres via
+    db/queries.py instead of parsing a Tally XML file (see CLAUDE.md's
+    "Postgres data layer" section, "Migrating the checks" subsection).
+    run_check() itself is completely unchanged -- this function only swaps
+    the input source. Returns status="insufficient_data" (same contract as
+    run_check_from_file) if no ledger masters are stored for this
+    client/fy/version, or if the database can't be reached -- both mean
+    "the check cannot run", the same class of failure a missing/unparseable
+    XML file would be. Zero vouchers alone is NOT treated as
+    insufficient_data (a genuinely quiet period is valid input, same as an
+    XML file with masters but no vouchers) -- only zero ledger masters is,
+    since a real Tally export always has at least some ledgers even with no
+    activity for the period.
+    """
+    # Imported lazily -- see the identical note in
+    # opening_balance_vs_prior_year_closing.run_check_from_db.
+    import psycopg
+
+    from db.queries import get_tally_data
+
+    try:
+        tally_data = get_tally_data(client_id, fy, version_id)
+    except psycopg.Error as e:
+        return [CheckResult(
+            check_id=CHECK_ID,
+            status="insufficient_data",
+            confidence_score=1.0,
+            description=f"Could not load Tally data from the database for client '{client_id}', FY {fy}, version '{version_id}': {e}",
+            amount=None,
+            source_reference=SourceReference(),
+        )]
+    if not tally_data.ledgers:
+        return [CheckResult(
+            check_id=CHECK_ID,
+            status="insufficient_data",
+            confidence_score=1.0,
+            description=f"No Tally ledger masters found in the database for client '{client_id}', FY {fy}, version '{version_id}'.",
+            amount=None,
+            source_reference=SourceReference(),
+        )]
+
+    return run_check(tally_data)
+
+
 def run_check_from_file(tally_xml_path: str) -> List[CheckResult]:
     """Loads the Tally XML file and runs the check. If it can't be read or
     parsed, returns a single check-level status="insufficient_data" result
