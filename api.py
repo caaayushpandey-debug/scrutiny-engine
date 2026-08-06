@@ -15,7 +15,16 @@ Endpoints:
 - POST /run-checks, wrapping check #1 specifically -- this is not a generic
   "run any check by ID" dispatcher. If/when more checks are added, revisit
   whether this should become registry-driven (see coordinator.py /
-  checks/registry.py) rather than hardcoded to one check.
+  checks/registry.py) rather than hardcoded to one check. Accepts EITHER the
+  original raw-payload body (prior_year_trial_balance +
+  current_year_trial_balance, unchanged) OR a client_id + fy + version_id
+  reference (added 2026-08-06, feature/postgres-data-layer) that reads both
+  trial balances from Postgres via checks/
+  opening_balance_vs_prior_year_closing.run_check_from_db instead -- see
+  RunChecksRequest's own docstring and CLAUDE.md's "Postgres data layer"
+  section. Never both, never neither -- a request supplying fields from both
+  modes, or neither, is rejected with 422 by RunChecksRequest's own
+  validator before the handler runs at all.
 - POST /parse-trial-balance, a raw-CSV-upload -> {"ledgers": [...]}
   preprocessing step (see trial_balance_csv_parser.py for the tolerant
   parsing logic), so the frontend doesn't have to parse Trial Balance CSVs
@@ -39,9 +48,12 @@ Endpoints:
   never trusted to tell the two files apart.
 - POST /run-suspense-check, wrapping checks/suspense_account_scrutiny.py
   specifically (same one-check-per-endpoint approach as /run-checks, not a
-  registry-driven dispatcher). Takes the same TallyData shape
-  /parse-tally-xml returns, so the two chain directly: upload Tally XML to
-  /parse-tally-xml, feed its response straight into /run-suspense-check.
+  registry-driven dispatcher). Accepts EITHER the same raw TallyData shape
+  /parse-tally-xml returns (ledgers + vouchers, unchanged -- upload Tally
+  XML to /parse-tally-xml, feed its response straight into
+  /run-suspense-check) OR a client_id + fy + version_id reference (same
+  dual-mode pattern as /run-checks above) that reads TallyData from
+  Postgres via run_check_from_db instead. See TallyDataIn's own docstring.
 
 File-parsing error responses (added 2026-08-08): all three upload endpoints
 above (/parse-trial-balance, /parse-tally-xml, /parse-tally-xml-multi) return
@@ -62,10 +74,11 @@ from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check
+from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check, run_check_from_db
 from checks.suspense_account_scrutiny import run_check as run_suspense_account_scrutiny
+from checks.suspense_account_scrutiny import run_check_from_db as run_suspense_check_from_db
 from parse_error_classification import classify_parse_error
 from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
@@ -116,11 +129,46 @@ class TrialBalanceIn(BaseModel):
 
 
 class RunChecksRequest(BaseModel):
-    prior_year_trial_balance: TrialBalanceIn
-    current_year_trial_balance: TrialBalanceIn
+    """Accepts EITHER the original raw-payload shape (prior_year_trial_balance
+    + current_year_trial_balance, unchanged for backward compatibility) OR a
+    client_id/fy/version_id reference into Postgres (see CLAUDE.md's
+    "Postgres data layer" section) -- never both, never neither. This is the
+    frontend-facing input-source swap this task adds; run_checks() below just
+    dispatches on which mode was supplied, since checks/
+    opening_balance_vs_prior_year_closing.py itself already exposes both
+    run_check (payload) and run_check_from_db (reference) unchanged.
+    """
+    prior_year_trial_balance: Optional[TrialBalanceIn] = None
+    current_year_trial_balance: Optional[TrialBalanceIn] = None
+    client_id: Optional[str] = None
+    fy: Optional[str] = None
+    version_id: Optional[str] = None
     # Rupee tolerance for amount mismatches; defaults to the check's own
-    # DEFAULT_TOLERANCE (Rs 1.00) if omitted.
+    # DEFAULT_TOLERANCE (Rs 1.00) if omitted. Applies to both input modes.
     tolerance: Optional[Decimal] = None
+
+    @model_validator(mode="after")
+    def _validate_exactly_one_input_mode(self) -> "RunChecksRequest":
+        has_payload = self.prior_year_trial_balance is not None or self.current_year_trial_balance is not None
+        has_reference = self.client_id is not None or self.fy is not None or self.version_id is not None
+
+        if has_payload and has_reference:
+            raise ValueError(
+                "Provide either prior_year_trial_balance + current_year_trial_balance, "
+                "or client_id + fy + version_id -- not both."
+            )
+        if has_payload:
+            if self.prior_year_trial_balance is None or self.current_year_trial_balance is None:
+                raise ValueError("prior_year_trial_balance and current_year_trial_balance are both required together.")
+        elif has_reference:
+            if not (self.client_id and self.fy and self.version_id):
+                raise ValueError("client_id, fy, and version_id are all required together.")
+        else:
+            raise ValueError(
+                "Provide either prior_year_trial_balance + current_year_trial_balance, "
+                "or client_id + fy + version_id."
+            )
+        return self
 
 
 @app.get("/health")
@@ -130,13 +178,26 @@ def health() -> dict:
 
 @app.post("/run-checks")
 def run_checks(request: RunChecksRequest) -> List[dict]:
-    """Runs check #1 against the two supplied trial balances and returns its
-    results in the standard CheckResult shape (CLAUDE.md HARD RULE #2/#6).
+    """Runs check #1 and returns its results in the standard CheckResult
+    shape (CLAUDE.md HARD RULE #2/#6). Input source depends on which fields
+    RunChecksRequest was given -- see its own docstring:
+    - client_id/fy/version_id given -> run_check_from_db (Postgres). A
+      "no data found" or "database unreachable" outcome is NOT an HTTP
+      error -- it comes back as a normal 200 response with a
+      status="insufficient_data" CheckResult, same contract every other
+      check entry point already uses (see run_check_from_db's own
+      docstring).
+    - prior_year_trial_balance/current_year_trial_balance given -> run_check
+      (raw payload), completely unchanged from before this task.
     """
+    tolerance = request.tolerance if request.tolerance is not None else DEFAULT_TOLERANCE
+
+    if request.client_id is not None:
+        results = run_check_from_db(request.client_id, request.fy, request.version_id, tolerance=tolerance)
+        return [r.to_dict() for r in results]
+
     if not request.prior_year_trial_balance.ledgers and not request.current_year_trial_balance.ledgers:
         raise HTTPException(status_code=400, detail="Both trial balances are empty -- nothing to check.")
-
-    tolerance = request.tolerance if request.tolerance is not None else DEFAULT_TOLERANCE
 
     results = run_check(
         prior_year_trial_balance=request.prior_year_trial_balance.to_domain(),
@@ -203,8 +264,34 @@ class TallyVoucherIn(BaseModel):
 
 
 class TallyDataIn(BaseModel):
-    ledgers: List[TallyLedgerMasterIn]
-    vouchers: List[TallyVoucherIn]
+    """Accepts EITHER the original raw-payload shape (ledgers + vouchers,
+    unchanged for backward compatibility -- exactly what /parse-tally-xml
+    returns) OR a client_id/fy/version_id reference into Postgres -- never
+    both, never neither. Same dual-mode pattern as RunChecksRequest above;
+    see that class's docstring for the full rationale.
+    """
+    ledgers: Optional[List[TallyLedgerMasterIn]] = None
+    vouchers: Optional[List[TallyVoucherIn]] = None
+    client_id: Optional[str] = None
+    fy: Optional[str] = None
+    version_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_exactly_one_input_mode(self) -> "TallyDataIn":
+        has_payload = self.ledgers is not None or self.vouchers is not None
+        has_reference = self.client_id is not None or self.fy is not None or self.version_id is not None
+
+        if has_payload and has_reference:
+            raise ValueError("Provide either ledgers + vouchers, or client_id + fy + version_id -- not both.")
+        if has_payload:
+            if self.ledgers is None or self.vouchers is None:
+                raise ValueError("ledgers and vouchers are both required together.")
+        elif has_reference:
+            if not (self.client_id and self.fy and self.version_id):
+                raise ValueError("client_id, fy, and version_id are all required together.")
+        else:
+            raise ValueError("Provide either ledgers + vouchers, or client_id + fy + version_id.")
+        return self
 
     def to_domain(self) -> TallyData:
         return TallyData(
@@ -224,11 +311,21 @@ class TallyDataIn(BaseModel):
 
 @app.post("/run-suspense-check")
 def run_suspense_check(request: TallyDataIn) -> List[dict]:
-    """Runs checks/suspense_account_scrutiny.py against the supplied
-    TallyData and returns its results in the standard CheckResult shape
-    (CLAUDE.md HARD RULE #2/#6). Accepts exactly the shape /parse-tally-xml
-    returns, so the two endpoints chain directly.
+    """Runs checks/suspense_account_scrutiny.py and returns its results in
+    the standard CheckResult shape (CLAUDE.md HARD RULE #2/#6). Input source
+    depends on which fields TallyDataIn was given -- see its own docstring:
+    - client_id/fy/version_id given -> run_check_from_db (Postgres). A
+      "no data found" or "database unreachable" outcome comes back as a
+      normal 200 response with a status="insufficient_data" CheckResult,
+      same as /run-checks' reference path above.
+    - ledgers/vouchers given -> run_suspense_account_scrutiny (raw payload,
+      the same shape /parse-tally-xml returns), completely unchanged from
+      before this task.
     """
+    if request.client_id is not None:
+        results = run_suspense_check_from_db(request.client_id, request.fy, request.version_id)
+        return [r.to_dict() for r in results]
+
     if not request.ledgers and not request.vouchers:
         raise HTTPException(status_code=400, detail="Tally data is empty -- nothing to check.")
 

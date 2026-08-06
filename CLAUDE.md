@@ -598,6 +598,26 @@ without crashing.
     numbers. Optional `tolerance` (string, rupees) overrides the check's
     default. Returns a JSON array of `CheckResult.to_dict()` — the same shape
     `checks/opening_balance_vs_prior_year_closing.py`'s own `main()` prints.
+    **Dual input mode** (added 2026-08-06, `feature/postgres-data-layer`):
+    the request body may instead supply `client_id` + `fy` + `version_id`
+    (optionally still with `tolerance`) to read both trial balances from
+    Postgres via `run_check_from_db` instead of the raw payload above —
+    `RunChecksRequest`'s own `model_validator` rejects (422) a request
+    supplying fields from both modes, or neither. A reference to a
+    client/fy/version with no data yet (or a database that can't be
+    reached) is NOT an HTTP error — it comes back as a normal 200 with a
+    single `status="insufficient_data"` result, same contract every other
+    check entry point already uses. Confirmed live against a running server
+    (not just unit-level): the reference-mode result for
+    `tb_05_coral_bay_infratech_pvt_ltd`/`2025-26`/`v1` (loaded by
+    `db/load_sample_data.py`) is byte-for-byte identical to the
+    payload-mode result for that same company's CSVs uploaded through
+    `/parse-trial-balance` — same 31 ledgers, same statuses, same amounts.
+    Also confirmed: both-modes-given and neither-mode-given both 422 before
+    the handler runs at all (the validator, not application logic, rejects
+    them), and every existing raw-payload call
+    (`tests/test_api_manual.py`) still passes unmodified against the live
+    server.
   - `POST /parse-trial-balance` — raw CSV file upload (multipart/form-data,
     field name `file`) → the same `{"ledgers": [...]}` shape `/run-checks`
     consumes (debit/credit returned as strings, same precision reasoning).
@@ -708,7 +728,17 @@ without crashing.
     companies, the same result
     `verify_suspense_account_scrutiny_against_data_synthesizer.py` already
     proved at the Python-function level, now confirmed reachable over HTTP
-    too.
+    too. **Dual input mode** (added 2026-08-06, `feature/postgres-data-layer`,
+    same pattern and same commit as `/run-checks` above): the request body
+    may instead supply `client_id` + `fy` + `version_id` to read `TallyData`
+    from Postgres via `run_check_from_db` instead of `ledgers`/`vouchers` —
+    `TallyDataIn`'s own `model_validator` rejects (422) both-modes-given or
+    neither-given. Confirmed live: the reference-mode result for
+    `txml_03_lumina_packaging_pvt_ltd`/`2025-26`/`v1` is byte-for-byte
+    identical to the payload-mode result for that same company's
+    `tally_export.xml` uploaded through `/parse-tally-xml` (same 2 flagged
+    postings, same amounts), and a nonexistent client_id returns a normal
+    200 with `status="insufficient_data"`, not an HTTP error.
   - `GET /health` for a basic liveness check. Auto-generated interactive docs
     at `/docs` once running.
   Run locally: `./venv/bin/uvicorn api:app --reload --port 8000`.
