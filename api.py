@@ -25,6 +25,15 @@ Endpoints:
   section. Never both, never neither -- a request supplying fields from both
   modes, or neither, is rejected with 422 by RunChecksRequest's own
   validator before the handler runs at all.
+- POST /store-trial-balance (added 2026-08-06, feature/postgres-data-layer)
+  -- persists an already-parsed TrialBalance into Postgres, keyed by
+  client_id + fy + scope[+ version_id], so a later /run-checks reference-mode
+  call can read it back. A separate step from both parsing (the frontend
+  calls /parse-trial-balance first) and running the check -- there is no
+  browser-reachable way to write to Postgres directly (no client-side
+  driver, unlike Firestore's own client SDK), so this endpoint is that write
+  path. Upserts (safe to call again for the same version/scope, e.g. a
+  "Replace File" correction). See StoreTrialBalanceRequest's own docstring.
 - POST /parse-trial-balance, a raw-CSV-upload -> {"ledgers": [...]}
   preprocessing step (see trial_balance_csv_parser.py for the tolerant
   parsing logic), so the frontend doesn't have to parse Trial Balance CSVs
@@ -54,6 +63,11 @@ Endpoints:
   /run-suspense-check) OR a client_id + fy + version_id reference (same
   dual-mode pattern as /run-checks above) that reads TallyData from
   Postgres via run_check_from_db instead. See TallyDataIn's own docstring.
+- POST /store-tally-data (added 2026-08-06, feature/postgres-data-layer) --
+  the tally_data counterpart to /store-trial-balance above: persists an
+  already-parsed TallyData into Postgres, keyed by client_id + fy +
+  version_id (always required -- TALLY_DATA has no prior-year scope). See
+  StoreTallyDataRequest's own docstring.
 
 File-parsing error responses (added 2026-08-08): all three upload endpoints
 above (/parse-trial-balance, /parse-tally-xml, /parse-tally-xml-multi) return
@@ -79,7 +93,9 @@ from pydantic import BaseModel, Field, model_validator
 from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check, run_check_from_db
 from checks.suspense_account_scrutiny import run_check as run_suspense_account_scrutiny
 from checks.suspense_account_scrutiny import run_check_from_db as run_suspense_check_from_db
+from db.queries import insert_tally_data, insert_trial_balance_ledgers
 from parse_error_classification import classify_parse_error
+from schemas.enums import DocumentScope
 from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
 from tally_xml_parser import parse_tally_xml_data, parse_tally_xml_data_multi
@@ -208,6 +224,51 @@ def run_checks(request: RunChecksRequest) -> List[dict]:
     return [r.to_dict() for r in results]
 
 
+class StoreTrialBalanceRequest(BaseModel):
+    """Persists an already-parsed TrialBalance into Postgres (see CLAUDE.md's
+    "Postgres data layer" section) so a later /run-checks reference-mode call
+    (client_id/fy/version_id) can read it back. This is a separate step from
+    parsing (/parse-trial-balance) and from running the check (/run-checks) --
+    the frontend calls /parse-trial-balance to get structured ledgers, then
+    THIS endpoint to persist them, independently of whether/when the check is
+    ever run. There is no browser-reachable way to write to Postgres directly
+    (no client-side driver, unlike Firestore's client SDK), so this endpoint
+    exists specifically to be that write path.
+    """
+    client_id: str
+    fy: str
+    scope: DocumentScope
+    # Required when scope=version_scoped, ignored (forced to None) when
+    # scope=period_scoped_prior_year -- see db/schema.sql's CHECK constraint
+    # and insert_trial_balance_ledgers' own handling of this.
+    version_id: Optional[str] = None
+    ledgers: List[LedgerBalanceIn]
+
+    @model_validator(mode="after")
+    def _validate_version_id_matches_scope(self) -> "StoreTrialBalanceRequest":
+        if self.scope == DocumentScope.VERSION_SCOPED and not self.version_id:
+            raise ValueError("version_id is required when scope is version_scoped.")
+        return self
+
+
+@app.post("/store-trial-balance")
+def store_trial_balance(request: StoreTrialBalanceRequest) -> dict:
+    """Upserts request.ledgers into trial_balance_ledgers for
+    (client_id, fy, scope[, version_id]) -- safe to call again for the same
+    version/scope (e.g. a "Replace File" correction), which simply overwrites
+    the prior rows rather than duplicating them.
+    """
+    trial_balance = TrialBalanceIn(ledgers=request.ledgers).to_domain()
+    try:
+        insert_trial_balance_ledgers(
+            request.client_id, request.fy, request.scope, trial_balance, version_id=request.version_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not store trial balance in the database: {e}")
+
+    return {"stored_ledgers": len(trial_balance.ledgers)}
+
+
 @app.post("/parse-trial-balance")
 async def parse_trial_balance(file: UploadFile = File(...)) -> dict:
     """Parses an uploaded Trial Balance CSV into the {"ledgers": [...]} shape
@@ -331,6 +392,37 @@ def run_suspense_check(request: TallyDataIn) -> List[dict]:
 
     results = run_suspense_account_scrutiny(request.to_domain())
     return [r.to_dict() for r in results]
+
+
+class StoreTallyDataRequest(BaseModel):
+    """Persists an already-parsed TallyData into Postgres, the tally_data
+    counterpart to StoreTrialBalanceRequest above -- see that class's
+    docstring for the full rationale (separate step from parsing and from
+    running the check; no browser-reachable way to write to Postgres
+    directly). TALLY_DATA has no prior-year scope (see schemas/enums.py's
+    DEFAULT_SCOPE_BY_DOCUMENT_TYPE docstring), so version_id is always
+    required here, unlike StoreTrialBalanceRequest's conditional one.
+    """
+    client_id: str
+    fy: str
+    version_id: str
+    ledgers: List[TallyLedgerMasterIn]
+    vouchers: List[TallyVoucherIn]
+
+
+@app.post("/store-tally-data")
+def store_tally_data(request: StoreTallyDataRequest) -> dict:
+    """Upserts request.ledgers/vouchers into tally_ledgers/tally_vouchers/
+    tally_voucher_legs for (client_id, fy, version_id) -- safe to call again
+    for the same version (e.g. a "Replace File" correction).
+    """
+    tally_data = TallyDataIn(ledgers=request.ledgers, vouchers=request.vouchers).to_domain()
+    try:
+        insert_tally_data(request.client_id, request.fy, request.version_id, tally_data)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not store Tally data in the database: {e}")
+
+    return {"stored_ledgers": len(tally_data.ledgers), "stored_vouchers": len(tally_data.vouchers)}
 
 
 def _tally_data_to_response(tally_data: TallyData) -> dict:
