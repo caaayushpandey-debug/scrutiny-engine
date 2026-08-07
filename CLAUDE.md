@@ -72,6 +72,14 @@ for a CA/CPA audit tool.
      change as current-year versions are revised.
    See "Document scope model" below for the full rationale and how the
    coordinator resolves each scope.
+8. No UI/UX or product-behavior change should be made based on your own
+   judgment of "this would be better" without first being explicitly asked
+   for by the user. If you notice something that could be improved, flag it
+   as a suggestion and wait for explicit approval — never implement a
+   proactive design/product change unprompted. This does not apply to bug
+   fixes, honesty/labeling fixes (like Coming Soon tags), or fixes
+   explicitly requested — only to unprompted "I think this would look/work
+   better" changes.
 
 ## WORKING RULE
 At the end of any task or meaningful chunk of work, always run git add, git
