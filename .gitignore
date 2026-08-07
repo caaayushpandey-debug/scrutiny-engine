@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 .DS_Store
 venv/
+
+# Real, un-anonymized client Tally exports live here and must NEVER be committed.
+# Drop real files into real_sample_data/; anonymize_tally_xml.py writes safe,
+# fake-data copies into real_sample_data/anonymized/. The whole tree is ignored
+# so neither the real inputs nor their (still-under-review) anonymized outputs
+# can be pushed by accident.
+real_sample_data/
