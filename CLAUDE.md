@@ -458,9 +458,12 @@ without crashing.
   `TrialBalance` of permanent (balance-sheet) ledgers' *closing* balances,
   computed by summing every voucher leg against each ledger's opening
   balance — not read from any single stated field. Validates Tally's
-  ISDEEMEDPOSITIVE/AMOUNT sign convention (rejects inconsistencies rather
-  than trusting one field over the other) and that every voucher's legs sum
-  to zero. Excludes Profit & Loss ledgers (Tally's own fixed primary-group
+  ISDEEMEDPOSITIVE/AMOUNT sign convention (**relaxed 2026-08-08** -- a
+  disagreement between the two is tolerated, not rejected, since real
+  "Rounding Off" legs legitimately disagree; the signed AMOUNT is
+  authoritative and the sum-to-zero check is the real guard -- see the
+  "Real-world structural robustness pass" below) and that every voucher's
+  legs sum to zero. Excludes Profit & Loss ledgers (Tally's own fixed primary-group
   list: Sales/Purchase Accounts, Direct/Indirect Incomes/Expenses) from the
   `TrialBalance` output, matching `opening_balance_vs_prior_year_closing.py`'s
   documented balance-sheet-only assumption.
@@ -568,6 +571,119 @@ without crashing.
     combined entry point. `parse_tally_xml_data` (single file) is
     unchanged/backward compatible -- still requires the file to be
     self-contained.
+  - **Real-world structural robustness pass (added 2026-08-08)** -- the first
+    analysis against a set of REAL, whole-company Tally exports (four files:
+    two ~9MB masters + two ~150MB transactions, one real cafe company),
+    anonymized structure-preserving by `anonymize_tally_xml.py` (repo root --
+    see its docstring; real inputs and their anonymized copies both live in
+    the gitignored `real_sample_data/`, never committed). Every sample used
+    before this was `data-synthesizer`'s synthetic output, which never
+    exercised any of the following; each was a HARD PARSE FAILURE or a silent
+    misclassification on the real files until fixed:
+    - **`<LEDGERENTRIES.LIST>` is a valid ledger-entry container**, used by
+      invoice-mode vouchers (Purchase/Sales), where `<ALLLEDGERENTRIES.LIST>`
+      is used by accounting-mode vouchers (Receipt/Payment/Contra/Journal). A
+      real file's Purchase/Sales vouchers carry ONLY `<LEDGERENTRIES.LIST>`
+      (alongside a parallel `<ALLINVENTORYENTRIES.LIST>` that this parser does
+      NOT need -- the top-level ledger entries already sum to zero on their
+      own; inventory is separate detail). `_extract_vouchers` now reads BOTH
+      containers (an OR, not either/or) so a voucher that somehow used both
+      would have all its legs counted. Previously it read only
+      `ALLLEDGERENTRIES.LIST`, so every invoice voucher looked like it had 0
+      ledger entries and raised "fewer than 2 ledger entries".
+    - **Duplicate GROUP masters, and built-in primary groups emitted as GROUP
+      masters, are both normal in real files.** Real Tally emits a `<GROUP>`
+      master for its own built-in primary groups (`Sundry Creditors`,
+      `Sales Accounts`, `Current Liabilities`, ...) -- directly contradicting
+      the original assumption (see `schemas/tally_data.py`'s `TallyGroupMaster`
+      docstring, now corrected) that only company-created custom groups ever
+      get a master. One real masters file also emitted 37 groups TWICE, all
+      with identical PARENT. `_extract_group_masters` / `_extract_ledger_
+      masters_raw` now **dedupe an exact-duplicate master silently** (same
+      PARENT, and for ledgers same OPENINGBALANCE) and raise only on a
+      genuine CONFLICT (same NAME, different PARENT / different explicitly-
+      stated opening balance) -- previously any duplicate NAME raised
+      outright.
+    - **`resolve_top_level_group` walk fix (`schemas/tally_data.py`).** With
+      built-in primaries now present as group masters, the old walk
+      overshot: it stepped from a primary (e.g. `Sales Accounts`, whose own
+      emitted master has an EMPTY `<PARENT>`) into `""` and returned the
+      empty string, so P&L filtering silently broke (a Sales ledger resolved
+      to `""`, didn't match `PROFIT_AND_LOSS_PARENT_GROUPS`, and was wrongly
+      kept in the balance-sheet `TrialBalance`). The walk now STOPS at the
+      last non-empty group -- i.e. when the next parent is empty/absent or
+      already seen -- returning the primary itself. Verified it still returns
+      the same answer for the pre-existing custom-subgroup-of-a-built-in case
+      where the built-in is NOT a master.
+    - **Transaction files embed their own masters, overlapping the masters
+      file -- the multi-file merge must dedupe, not reject.** A real ~150MB
+      transactions file embedded 200 `<LEDGER>` + 26 `<GROUP>` masters, ALL
+      overlapping the dedicated masters file. `merge_tally_xml_fragments`
+      previously raised on ANY duplicate master across files, so the normal
+      split-file upload flow hard-failed. It now merges duplicates with the
+      same identical-vs-conflict rule as within a file, with one important
+      wrinkle: of the 200 overlapping ledgers, ~98 differed because one file
+      STATED an `<OPENINGBALANCE>` and the other OMITTED it (they're masters
+      as-of different dates). The merge **prefers the entry whose opening
+      balance is explicitly present** (and the non-empty PARENT) over an
+      absent/defaulted one, so the authoritative masters-file balance wins
+      regardless of file order; it raises only when BOTH files state a
+      balance for the same ledger and the two DIFFER (a true conflict the
+      parser cannot silently resolve).
+    - **Cancelled / deleted / optional vouchers are skipped.** A voucher with
+      `<ISCANCELLED>Yes</ISCANCELLED>`, `<ISDELETED>Yes</ISDELETED>`, or
+      `<ISOPTIONAL>Yes</ISOPTIONAL>` is not a posted book entry, so
+      `_extract_vouchers` drops it (before the >=2-legs / sum-to-zero checks,
+      since a cancelled voucher can legitimately be empty or unbalanced).
+      None of `ISCANCELLED`/`ISDELETED=Yes` appeared in this real data;
+      `ISOPTIONAL=Yes` did (4 vouchers). Skipping is the defensible default
+      (these don't affect the books); documented here as a deliberate choice,
+      not an accident.
+    - **Ledger/Group NAME attributes are stripped of surrounding
+      whitespace.** Real Tally pads a master's NAME attribute with a trailing
+      space (`<LEDGER NAME="Ashok Joshi ">`) while the SAME ledger's
+      `<LEDGERNAME>` references in vouchers are unpadded (`Ashok Joshi`).
+      `_required_text` already strips `<LEDGERNAME>`/`<PARENT>` text, so the
+      NAME attribute must be stripped too in `_extract_ledger_masters_raw` /
+      `_extract_group_masters` -- otherwise the padded master is keyed
+      `"Ashok Joshi "` and its own legs (looking for `"Ashok Joshi"`) don't
+      resolve, raising "references ledger '...' which has no matching <LEDGER>
+      master". Found only at the referential-integrity step against a real
+      transactions file. (Two padded names differing only by whitespace
+      collapse to one after stripping -- correct, since Tally treats them as
+      the same ledger -- and are then handled by the dedupe/conflict rule
+      above.)
+    - **ISDEEMEDPOSITIVE/AMOUNT sign disagreement is tolerated, not
+      rejected.** A real "Rounding Off" leg was marked
+      `<ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>` (credit) with a NEGATIVE
+      `<AMOUNT>-0.20</AMOUNT>` -- the parser previously rejected the entire
+      file for the sign mismatch. The signed AMOUNT is authoritative for all
+      balance math (`closing_balance` uses `-AMOUNT`, never the is_debit flag)
+      and the per-voucher legs-sum-to-zero check is the real integrity guard,
+      which is unchanged and still raises. ISDEEMEDPOSITIVE must still be
+      exactly `Yes`/`No`; it just no longer has to agree with AMOUNT's sign.
+      (Also seen and already handled gracefully: vouchers with no
+      `<VOUCHERNUMBER>` at all -- the parser defaults the label rather than
+      erroring.)
+    - **Leg AMOUNT is read from the DIRECT-child `<AMOUNT>` only.** Real
+      ledger entries nest `<BILLALLOCATIONS.LIST>`/`<BANKALLOCATIONS.LIST>`
+      that contain their OWN `<AMOUNT>` (200+ such blocks in the real data);
+      the leg's amount is its direct-child `AMOUNT`, never a descendant.
+      `ElementTree`'s `find("AMOUNT")` is direct-child-only, so this was
+      already correct -- called out here (and covered by a new test) so a
+      future refactor to `.//AMOUNT` or a regex can't silently reintroduce
+      double-counting.
+    - Confirmed still handled from before, now also against real data at
+      scale: UTF-16 LE + BOM; `&#4;` illegal numeric entities appearing in
+      NORMAL fields (`<GSTAPPLICABLE>&#4; Applicable</GSTAPPLICABLE>`), not
+      just `STATKEY`; `₹`; absent `<OPENINGBALANCE>` (229-239 of 379 ledgers);
+      empty `<PARENT/>`; the ISDEEMEDPOSITIVE(`Yes`/-, `No`/+) sign
+      convention and legs-summing-to-zero across ALL voucher types including
+      invoice mode.
+    Verified end-to-end: the full `unittest` suite plus parsing all four real
+    anonymized files (both masters standalone, and each masters+transactions
+    pair via `parse_tally_xml_data_multi`) -- see
+    `tests/verify_against_real_anonymized_tally.py`.
   Unit tests: `tests/test_tally_xml_parser.py` (70 tests: sign-convention
   math, P&L filtering, group-hierarchy resolution, encoding normalization
   — including both the entity-reference and raw-literal illegal-character

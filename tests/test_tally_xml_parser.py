@@ -410,15 +410,60 @@ class GroupHierarchyResolutionTests(unittest.TestCase):
         result = data.resolve_top_level_group("Some Ledger")
         self.assertIn(result, ("Group A", "Group B"))
 
-    def test_duplicate_group_name_raises(self):
+    def test_identical_duplicate_group_master_is_deduped_not_rejected(self):
+        # Real files emit the same group master more than once with an
+        # identical PARENT (see CLAUDE.md "Real-world structural robustness
+        # pass"). This must dedupe silently, not raise.
         xml = build_xml(
             group_xml("Overseas Debtors", "Sundry Debtors"),
             group_xml("Overseas Debtors", "Sundry Debtors"),
             ledger_xml("Some Ledger", "Overseas Debtors", "0.00"),
         )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(len(data.groups), 1)
+        self.assertEqual(data.resolve_top_level_group("Some Ledger"), "Sundry Debtors")
+
+    def test_conflicting_duplicate_group_master_raises(self):
+        # Same NAME, DIFFERENT non-empty parent -> a genuine conflict.
+        xml = build_xml(
+            group_xml("Overseas Debtors", "Sundry Debtors"),
+            group_xml("Overseas Debtors", "Sundry Creditors"),
+            ledger_xml("Some Ledger", "Overseas Debtors", "0.00"),
+        )
         with self.assertRaises(TallyXmlParseError) as ctx:
             parse_tally_xml_data(xml)
-        self.assertIn("Duplicate group", str(ctx.exception))
+        self.assertIn("conflicting parents", str(ctx.exception))
+
+    def test_builtin_primary_group_emitted_as_master_resolves_correctly(self):
+        # Real Tally emits <GROUP> masters for its own built-in primaries,
+        # with the top primary carrying an EMPTY parent. The resolve walk must
+        # stop at the primary, not step into "" (which would break P&L
+        # filtering). Chain: ledger -> custom vendor group -> Sundry Creditors
+        # -> Current Liabilities (empty parent).
+        xml = build_xml(
+            group_xml("Current Liabilities", ""),
+            group_xml("Sundry Creditors", "Current Liabilities"),
+            group_xml("Food Vendors", "Sundry Creditors"),
+            ledger_xml("A Vendor", "Food Vendors", "1000.00"),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.resolve_top_level_group("A Vendor"), "Current Liabilities")
+
+    def test_builtin_pl_group_as_master_still_excluded_from_trial_balance(self):
+        # A Sales ledger under "Sales Accounts" emitted as a master (empty
+        # parent) must still resolve to "Sales Accounts" and be excluded from
+        # the balance-sheet TrialBalance -- the walk must not overshoot to "".
+        xml = build_xml(
+            group_xml("Sales Accounts", ""),
+            ledger_xml("Permanent BS Ledger", "Current Assets", "5000.00"),
+            ledger_xml("Food Sales", "Sales Accounts", "0.00"),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.resolve_top_level_group("Food Sales"), "Sales Accounts")
+        tb = parse_tally_xml(xml)
+        names = [l.name for l in tb.ledgers]
+        self.assertIn("Permanent BS Ledger", names)
+        self.assertNotIn("Food Sales", names)
 
     def test_group_with_no_name_raises(self):
         xml = build_xml(b"""
@@ -671,20 +716,65 @@ class SplitMastersTransactionsTests(unittest.TestCase):
             parse_tally_xml_data_multi([self._transactions_only_file()])
         self.assertIn("No <LEDGER> master elements found in any", str(ctx.exception))
 
-    def test_duplicate_ledger_across_files_raises(self):
-        file_a = build_xml(ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"))
-        file_b = build_xml(ledger_xml("HDFC Bank", "Bank Accounts", "2000.00"))
-        with self.assertRaises(TallyXmlParseError) as ctx:
-            parse_tally_xml_data_multi([file_a, file_b])
-        self.assertIn("Duplicate ledger master", str(ctx.exception))
-        self.assertIn("across the uploaded files", str(ctx.exception))
+    def test_overlapping_ledger_across_files_deduped_when_one_omits_opening_balance(self):
+        # The real case (CLAUDE.md "Real-world structural robustness pass"): a
+        # transactions file embeds its own copy of a master that the masters
+        # file also has, with one file stating an opening balance the other
+        # omits. Merge must dedupe and keep the stated balance -- regardless
+        # of file order -- not reject.
+        with_ob = build_xml(ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"))
+        without_ob = ENVELOPE_OPEN + b"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="HDFC Bank" ACTION="Create"><PARENT>Bank Accounts</PARENT></LEDGER>
+        </TALLYMESSAGE>
+        """ + ENVELOPE_CLOSE
+        for order in ([with_ob, without_ob], [without_ob, with_ob]):
+            data = parse_tally_xml_data_multi(order)
+            self.assertEqual(len(data.ledgers), 1)
+            self.assertEqual(data.ledgers["HDFC Bank"].opening_balance, Decimal("1000.00"))
 
-    def test_duplicate_group_across_files_raises(self):
+    def test_conflicting_ledger_opening_balance_across_files_prefers_masters_file(self):
+        # Two DIFFERENT non-zero opening balances for the same ledger across a
+        # masters file and a transactions file is a legitimate snapshot
+        # difference (real: a bank ledger had different opening balances in the
+        # two files), NOT corruption -- so it must NOT raise. The dedicated
+        # masters file (more ledger masters) wins, regardless of upload order.
+        masters_file = build_xml(
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            ledger_xml("Other Ledger", "Current Assets", "50.00"),
+        )
+        trnx_file = build_xml(
+            ledger_xml("HDFC Bank", "Bank Accounts", "2000.00"),
+            voucher_xml("Contra", "C-1", [("HDFC Bank", True, "-10.00"), ("Other Ledger", False, "10.00")]),
+        )
+        for order in ([masters_file, trnx_file], [trnx_file, masters_file]):
+            data = parse_tally_xml_data_multi(order)
+            self.assertEqual(data.ledgers["HDFC Bank"].opening_balance, Decimal("1000.00"),
+                             "masters-file opening balance should win regardless of order")
+
+    def test_identical_group_across_files_deduped_not_rejected(self):
         file_a = build_xml(group_xml("Overseas Debtors", "Sundry Debtors"), ledger_xml("A", "Overseas Debtors", "0.00"))
         file_b = build_xml(group_xml("Overseas Debtors", "Sundry Debtors"), ledger_xml("B", "Overseas Debtors", "0.00"))
-        with self.assertRaises(TallyXmlParseError) as ctx:
-            parse_tally_xml_data_multi([file_a, file_b])
-        self.assertIn("Duplicate group master", str(ctx.exception))
+        data = parse_tally_xml_data_multi([file_a, file_b])
+        self.assertEqual(len(data.groups), 1)
+        self.assertEqual(set(data.ledgers), {"A", "B"})
+
+    def test_conflicting_group_across_files_resolves_to_masters_file(self):
+        # A group re-parented between a masters file and a transactions file is
+        # tolerated across files (unlike within one file). The masters-heavier
+        # file wins; it must not raise.
+        masters_file = build_xml(
+            group_xml("Overseas Debtors", "Sundry Debtors"),
+            ledger_xml("A", "Overseas Debtors", "0.00"),
+            ledger_xml("B", "Sundry Debtors", "0.00"),
+        )
+        trnx_file = build_xml(
+            group_xml("Overseas Debtors", "Sundry Creditors"),
+            voucher_xml("Journal", "J-1", [("A", True, "-5.00"), ("B", False, "5.00")]),
+        )
+        for order in ([masters_file, trnx_file], [trnx_file, masters_file]):
+            data = parse_tally_xml_data_multi(order)
+            self.assertEqual(data.groups["Overseas Debtors"].parent, "Sundry Debtors")
 
     def test_no_files_raises(self):
         with self.assertRaises(TallyXmlParseError):
@@ -714,14 +804,27 @@ class RejectionTests(unittest.TestCase):
         with self.assertRaises(TallyXmlParseError):
             parse_tally_xml(xml)
 
-    def test_duplicate_ledger_name_raises(self):
+    def test_conflicting_duplicate_ledger_name_raises(self):
+        # Same NAME in one file with two DIFFERENT non-zero opening balances
+        # is a genuine conflict (an identical/complementary duplicate would
+        # instead dedupe -- see the SplitMastersTransactions dedup tests).
         xml = build_xml(
             ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
             ledger_xml("HDFC Bank", "Bank Accounts", "2000.00"),
         )
         with self.assertRaises(TallyXmlParseError) as ctx:
             parse_tally_xml(xml)
-        self.assertIn("Duplicate", str(ctx.exception))
+        self.assertIn("conflicting opening balances", str(ctx.exception))
+
+    def test_identical_duplicate_ledger_name_in_one_file_is_deduped(self):
+        xml = build_xml(
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            ledger_xml("Sales Account", "Sales Accounts", "0.00"),
+            voucher_xml("Sales", "SI-1", [("HDFC Bank", True, "-500.00"), ("Sales Account", False, "500.00")]),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.ledgers["HDFC Bank"].opening_balance, Decimal("1000.00"))
 
     def test_voucher_with_one_leg_raises(self):
         xml = build_xml(
@@ -742,15 +845,37 @@ class RejectionTests(unittest.TestCase):
             parse_tally_xml(xml)
         self.assertIn("do not sum to zero", str(ctx.exception))
 
-    def test_debit_leg_with_positive_amount_raises(self):
+    def test_sign_disagreement_is_tolerated_when_voucher_still_balances(self):
+        # ISDEEMEDPOSITIVE vs AMOUNT sign disagreement is NOT rejected anymore
+        # (real "Rounding Off" legs legitimately disagree -- found 2026-08-08).
+        # The signed AMOUNT is authoritative and the sum-to-zero check is the
+        # real integrity guard: this voucher's legs still net to zero, so it
+        # parses, and balances are computed from AMOUNT.
         xml = build_xml(
             ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
             ledger_xml("Sales Account", "Sales Accounts", "0.00"),
             voucher_xml("Receipt", "RCT-0001", [("HDFC Bank", True, "500.00"), ("Sales Account", False, "-500.00")]),
         )
-        with self.assertRaises(TallyXmlParseError) as ctx:
-            parse_tally_xml(xml)
-        self.assertIn("sign convention", str(ctx.exception))
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(len(data.vouchers), 1)
+        self.assertEqual(data.closing_balance("HDFC Bank"), Decimal("500.00"))
+
+    def test_real_rounding_off_entry_credit_marked_but_negative_amount(self):
+        # The exact real shape: a credit-marked (No) rounding leg with a small
+        # negative amount, balanced by the rest of the voucher.
+        xml = build_xml(
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            ledger_xml("A Vendor", "Sundry Creditors", "0.00"),
+            ledger_xml("Rounding Off", "Indirect Expenses", "0.00"),
+            voucher_xml("Payment", "PV-1", [
+                ("A Vendor", True, "-100.20"),
+                ("Rounding Off", False, "-0.20"),   # credit-marked, negative amount
+                ("HDFC Bank", False, "100.40"),
+            ]),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(len(data.vouchers), 1)
+        self.assertEqual(data.closing_balance("Rounding Off"), Decimal("0.20"))
 
     def test_voucher_referencing_unknown_ledger_raises(self):
         xml = build_xml(
@@ -857,6 +982,163 @@ class ErrorSubclassTests(unittest.TestCase):
             self.assertNotIsInstance(e, TallyXmlMalformedError)
             self.assertNotIsInstance(e, TallyXmlNotATallyExportError)
             self.assertNotIsInstance(e, TallyXmlEncodingError)
+
+
+def invoice_voucher_xml(vch_type, vn, legs):
+    """Invoice-mode voucher: uses <LEDGERENTRIES.LIST> (Purchase/Sales) rather
+    than <ALLLEDGERENTRIES.LIST>, and carries a parallel (ignored)
+    <ALLINVENTORYENTRIES.LIST> -- the real shape found 2026-08-08."""
+    entries = "".join(f"""
+        <LEDGERENTRIES.LIST>
+          <LEDGERNAME>{name}</LEDGERNAME>
+          <ISDEEMEDPOSITIVE>{"Yes" if is_debit else "No"}</ISDEEMEDPOSITIVE>
+          <AMOUNT>{amount}</AMOUNT>
+        </LEDGERENTRIES.LIST>
+    """ for name, is_debit, amount in legs)
+    return f"""
+    <TALLYMESSAGE xmlns:UDF="TallyUDF">
+      <VOUCHER VCHTYPE="{vch_type}" ACTION="Create">
+        <DATE>20250401</DATE>
+        <VOUCHERNUMBER>{vn}</VOUCHERNUMBER>
+        <ALLINVENTORYENTRIES.LIST>
+          <STOCKITEMNAME>Some Item</STOCKITEMNAME>
+          <AMOUNT>1000.00</AMOUNT>
+        </ALLINVENTORYENTRIES.LIST>
+        {entries}
+      </VOUCHER>
+    </TALLYMESSAGE>
+    """.encode()
+
+
+class RealWorldStructuralPatternsTests(unittest.TestCase):
+    """Patterns found only against real (anonymized) Tally exports, 2026-08-08
+    -- see CLAUDE.md "Real-world structural robustness pass"."""
+
+    def _masters(self):
+        return (
+            ledger_xml("A Vendor", "Sundry Creditors", "0.00")
+            + ledger_xml("Food Purchases", "Purchase Accounts", "0.00")
+            + ledger_xml("HDFC Bank", "Bank Accounts", "1000.00")
+        )
+
+    def test_invoice_mode_ledgerentries_list_is_parsed(self):
+        # Previously raised "fewer than 2 ledger entries" because only
+        # ALLLEDGERENTRIES.LIST was read.
+        xml = build_xml(
+            self._masters(),
+            invoice_voucher_xml("Purchase", "PI-1",
+                                 [("Food Purchases", True, "-1000.00"), ("A Vendor", False, "1000.00")]),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(len(data.vouchers), 1)
+        self.assertEqual(len(data.vouchers[0].legs), 2)
+        # closing balance of the creditor reflects the credit leg
+        self.assertEqual(data.closing_balance("A Vendor"), Decimal("-1000.00"))
+
+    def test_invoice_mode_and_accounting_mode_vouchers_coexist(self):
+        xml = build_xml(
+            self._masters(),
+            invoice_voucher_xml("Purchase", "PI-1",
+                                 [("Food Purchases", True, "-1000.00"), ("A Vendor", False, "1000.00")]),
+            voucher_xml("Payment", "PV-1",
+                        [("A Vendor", True, "-1000.00"), ("HDFC Bank", False, "1000.00")]),
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(len(data.vouchers), 2)
+        # A Vendor: credited 1000 by the purchase, debited 1000 by the payment -> net 0
+        self.assertEqual(data.closing_balance("A Vendor"), Decimal("0.00"))
+
+    def _voucher_with_flag(self, flag):
+        return f"""
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <VOUCHER VCHTYPE="Journal" ACTION="Create">
+            <DATE>20250401</DATE>
+            <VOUCHERNUMBER>JV-SKIP</VOUCHERNUMBER>
+            <{flag}>Yes</{flag}>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>HDFC Bank</LEDGERNAME><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-1.00</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+          </VOUCHER>
+        </TALLYMESSAGE>
+        """.encode()
+
+    def test_cancelled_deleted_optional_vouchers_are_skipped(self):
+        # Each of these is a single-leg, unbalanced voucher -- if NOT skipped,
+        # it would raise "fewer than 2 ledger entries". Skipping proves it's
+        # dropped before validation.
+        for flag in ("ISCANCELLED", "ISDELETED", "ISOPTIONAL"):
+            xml = build_xml(
+                self._masters(),
+                voucher_xml("Payment", "PV-1",
+                            [("A Vendor", True, "-1000.00"), ("HDFC Bank", False, "1000.00")]),
+                self._voucher_with_flag(flag),
+            )
+            data = parse_tally_xml_data(xml)
+            self.assertEqual(len(data.vouchers), 1, f"{flag} voucher should be skipped")
+            self.assertEqual(data.vouchers[0].voucher_number, "PV-1")
+
+    def test_whitespace_padded_ledger_name_matches_its_voucher_legs(self):
+        # Real Tally pads a master's NAME attribute with a trailing space
+        # (NAME="Ashok Joshi ") while its <LEDGERNAME> leg references are
+        # unpadded ("Ashok Joshi"). The parser must strip NAME so the ledger
+        # matches its own legs -- previously raised "no matching <LEDGER>
+        # master".
+        padded_master = """
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <LEDGER NAME="Ashok Joshi " ACTION="Create">
+            <PARENT>Sundry Creditors</PARENT>
+            <OPENINGBALANCE>0.00</OPENINGBALANCE>
+          </LEDGER>
+        </TALLYMESSAGE>
+        """.encode()
+        xml = build_xml(
+            padded_master,
+            ledger_xml("HDFC Bank", "Bank Accounts", "1000.00"),
+            voucher_xml("Payment", "PV-1",
+                        [("Ashok Joshi", True, "-500.00"), ("HDFC Bank", False, "500.00")]),
+        )
+        data = parse_tally_xml_data(xml)
+        # master keyed by the stripped name; leg resolves to it
+        self.assertIn("Ashok Joshi", data.ledgers)
+        self.assertEqual(data.closing_balance("Ashok Joshi"), Decimal("500.00"))
+
+    def test_whitespace_padded_group_name_matches_child_parent_reference(self):
+        xml = build_xml(
+            group_xml("Overseas Debtors ", "Sundry Debtors"),  # padded group NAME
+            ledger_xml("A Customer", "Overseas Debtors", "100.00"),  # unpadded PARENT ref
+        )
+        data = parse_tally_xml_data(xml)
+        self.assertEqual(data.resolve_top_level_group("A Customer"), "Sundry Debtors")
+
+    def test_leg_amount_uses_direct_child_not_nested_allocation_amount(self):
+        # A real ledger entry nests BILLALLOCATIONS.LIST with its own <AMOUNT>.
+        # The leg's amount is the DIRECT child (-1000), never a nested one.
+        voucher = """
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <VOUCHER VCHTYPE="Payment" ACTION="Create">
+            <DATE>20250401</DATE>
+            <VOUCHERNUMBER>PV-1</VOUCHERNUMBER>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>A Vendor</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+              <AMOUNT>-1000.00</AMOUNT>
+              <BILLALLOCATIONS.LIST><NAME>B1</NAME><AMOUNT>-600.00</AMOUNT></BILLALLOCATIONS.LIST>
+              <BILLALLOCATIONS.LIST><NAME>B2</NAME><AMOUNT>-400.00</AMOUNT></BILLALLOCATIONS.LIST>
+            </ALLLEDGERENTRIES.LIST>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>HDFC Bank</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+              <AMOUNT>1000.00</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+          </VOUCHER>
+        </TALLYMESSAGE>
+        """.encode()
+        xml = build_xml(self._masters(), voucher)
+        data = parse_tally_xml_data(xml)
+        vend_leg = data.vouchers[0].leg_for("A Vendor")
+        self.assertEqual(vend_leg.amount, Decimal("-1000.00"))
+        # closing balance uses the direct-child amount only (0 - (-1000) = 1000)
+        self.assertEqual(data.closing_balance("A Vendor"), Decimal("1000.00"))
 
 
 if __name__ == "__main__":

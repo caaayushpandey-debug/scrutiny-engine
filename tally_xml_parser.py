@@ -57,16 +57,20 @@ field; it's computed as opening balance plus the signed effect of every
 voucher leg referencing that ledger, anywhere in the file.
 
 Tally's sign convention (verified against the generator's own output, and
-against real sample exports it's modelled on): a debit leg has
-ISDEEMEDPOSITIVE=Yes and a *negative* AMOUNT; a credit leg has
-ISDEEMEDPOSITIVE=No and a *positive* AMOUNT. Both fields are parsed and
-cross-checked against each other (see _extract_vouchers) -- if AMOUNT's
-sign is inconsistent with ISDEEMEDPOSITIVE, or a voucher's legs don't sum to
-zero, that's treated as a parse error, not silently trusted. In the
-debit-positive (debit - credit) convention schemas/trial_balance.py's
-LedgerBalance.net_balance and schemas/tally_data.py's TallyData use, a leg's
-effect on its ledger's balance is always exactly `-AMOUNT`, regardless of
-which side it's on.
+against real sample exports it's modelled on): a debit leg USUALLY has
+ISDEEMEDPOSITIVE=Yes and a *negative* AMOUNT; a credit leg USUALLY has
+ISDEEMEDPOSITIVE=No and a *positive* AMOUNT. Both fields are parsed, but a
+disagreement between them is NO LONGER treated as an error (relaxed
+2026-08-08): real files legitimately disagree on adjustment legs -- a real
+"Rounding Off" leg was marked ISDEEMEDPOSITIVE=No (credit) yet carried a
+negative AMOUNT (-0.20). The signed AMOUNT is authoritative for all balance
+math (a leg's effect on its ledger's balance is always exactly `-AMOUNT`, in
+the debit-positive convention schemas/trial_balance.py's
+LedgerBalance.net_balance and schemas/tally_data.py's TallyData use,
+regardless of which side ISDEEMEDPOSITIVE claims), and the real integrity
+guard is that a voucher's legs must still sum to zero (that check is kept and
+still raises). ISDEEMEDPOSITIVE must still be exactly "Yes"/"No" (a garbage
+value is still rejected); it just no longer has to agree with AMOUNT's sign.
 
 Balance-sheet vs P&L filtering (parse_tally_xml only)
 --------------------------------------------------------
@@ -491,6 +495,78 @@ def _parse_tally_date(raw: str, context: str) -> str:
         raise TallyXmlParseError(f"{context}: could not parse '{raw}' as a Tally date (expected YYYYMMDD).") from e
 
 
+def _reconcile_group(name: str, existing: TallyGroupMaster, new: TallyGroupMaster, strict: bool = True) -> TallyGroupMaster:
+    """Combine two group masters sharing a NAME (real files duplicate group
+    masters -- both within one file and across a masters+transactions pair --
+    see "Real-world structural robustness pass" in CLAUDE.md). Identical is a
+    no-op; a missing/empty PARENT defers to the populated one.
+
+    `strict` controls what happens on a genuine conflict (two DIFFERENT
+    non-empty parents): within a SINGLE file (strict=True) that's corruption
+    and raises; ACROSS files (strict=False, see merge_tally_xml_fragments)
+    it's tolerated and `existing` wins -- merge orders the dedicated masters
+    file first, so its value is the one kept."""
+    if existing.parent == new.parent:
+        return existing
+    if not existing.parent:
+        return new
+    if not new.parent:
+        return existing
+    if strict:
+        raise TallyXmlParseError(
+            f"Group master '{name}' appears more than once with conflicting parents "
+            f"('{existing.parent}' vs '{new.parent}') -- ambiguous which is authoritative."
+        )
+    return existing
+
+
+def _reconcile_ledger(name: str, existing: TallyLedgerMaster, new: TallyLedgerMaster, strict: bool = True) -> TallyLedgerMaster:
+    """Combine two ledger masters sharing a NAME. Real files carry the same
+    ledger in both the masters file and the (self-contained) transactions
+    file, often with one stating an <OPENINGBALANCE> the other omits, OR with
+    two DIFFERENT non-zero balances because the files are snapshots as-of
+    different dates. Rule: prefer the populated PARENT and the non-zero
+    opening balance (an omitted OPENINGBALANCE defaults to 0.00, so a real
+    stated balance always wins over an omitted one).
+
+    On a genuine conflict -- two different non-empty parents, or two different
+    NON-ZERO opening balances -- `strict` decides: within a SINGLE file
+    (strict=True) it's corruption and raises; ACROSS files (strict=False) it's
+    a legitimate snapshot difference (confirmed real: a bank ledger had
+    different opening balances in the masters file vs the transactions file)
+    and `existing` wins. merge_tally_xml_fragments orders the dedicated
+    masters file (most ledger masters) FIRST, so its opening balance -- the
+    authoritative one for opening_balance_vs_prior_year_closing -- is kept."""
+    if existing.parent == new.parent:
+        parent = existing.parent
+    elif not existing.parent:
+        parent = new.parent
+    elif not new.parent:
+        parent = existing.parent
+    elif strict:
+        raise TallyXmlParseError(
+            f"Ledger master '{name}' appears more than once with conflicting parents "
+            f"('{existing.parent}' vs '{new.parent}')."
+        )
+    else:
+        parent = existing.parent
+
+    if existing.opening_balance == new.opening_balance:
+        opening = existing.opening_balance
+    elif existing.opening_balance == 0:
+        opening = new.opening_balance
+    elif new.opening_balance == 0:
+        opening = existing.opening_balance
+    elif strict:
+        raise TallyXmlParseError(
+            f"Ledger master '{name}' appears more than once with conflicting opening balances "
+            f"({existing.opening_balance} vs {new.opening_balance}) -- ambiguous which is authoritative."
+        )
+    else:
+        opening = existing.opening_balance
+    return TallyLedgerMaster(name=name, parent=parent, opening_balance=opening)
+
+
 def _extract_ledger_masters_raw(root: ET.Element) -> Dict[str, TallyLedgerMaster]:
     """The actual extraction, with no requirement that any <LEDGER> be
     present -- a transactions-only fragment of a split export (see "Split
@@ -500,11 +576,17 @@ def _extract_ledger_masters_raw(root: ET.Element) -> Dict[str, TallyLedgerMaster
     """
     masters: Dict[str, TallyLedgerMaster] = {}
     for ledger_el in root.iter("LEDGER"):
-        name = ledger_el.get("NAME")
+        # Strip the NAME attribute: real Tally pads some ledger names with a
+        # trailing space in the master's NAME attribute (e.g. NAME="Ashok
+        # Joshi ") while the SAME ledger's <LEDGERNAME> references in vouchers
+        # are unpadded ("Ashok Joshi"). _required_text already strips
+        # <LEDGERNAME>/<PARENT>, so the master NAME must be stripped too or the
+        # ledger never matches its own legs (found against real files
+        # 2026-08-08 -- previously raised "references ledger '...' which has no
+        # matching <LEDGER> master").
+        name = (ledger_el.get("NAME") or "").strip()
         if not name:
             raise TallyXmlParseError("Found a <LEDGER> element with no NAME attribute.")
-        if name in masters:
-            raise TallyXmlParseError(f"Duplicate ledger master '{name}' -- ambiguous which opening balance is authoritative.")
 
         # PARENT may legitimately be EMPTY (<PARENT/>) -- see
         # _required_element_optional_text's docstring for the confirmed
@@ -520,7 +602,11 @@ def _extract_ledger_masters_raw(root: ET.Element) -> Dict[str, TallyLedgerMaster
             ledger_el, "OPENINGBALANCE", f"Ledger '{name}'", default=Decimal("0.00")
         )
 
-        masters[name] = TallyLedgerMaster(name=name, parent=parent, opening_balance=opening_balance)
+        candidate = TallyLedgerMaster(name=name, parent=parent, opening_balance=opening_balance)
+        # A NAME can appear more than once even within one file (real files do
+        # this); reconcile identical/complementary copies, raise on a genuine
+        # conflict -- see _reconcile_ledger.
+        masters[name] = _reconcile_ledger(name, masters[name], candidate) if name in masters else candidate
 
     return masters
 
@@ -544,16 +630,37 @@ def _extract_group_masters(root: ET.Element) -> Dict[str, TallyGroupMaster]:
     """
     groups: Dict[str, TallyGroupMaster] = {}
     for group_el in root.iter("GROUP"):
-        name = group_el.get("NAME")
+        # Strip NAME for the same reason as ledgers (see
+        # _extract_ledger_masters_raw) -- a group NAME padded with whitespace
+        # must still match a ledger's/child-group's stripped <PARENT> text.
+        name = (group_el.get("NAME") or "").strip()
         if not name:
             raise TallyXmlParseError("Found a <GROUP> element with no NAME attribute.")
-        if name in groups:
-            raise TallyXmlParseError(f"Duplicate group master '{name}' -- ambiguous which parent is authoritative.")
 
         parent = group_el.findtext("PARENT") or ""
-        groups[name] = TallyGroupMaster(name=name, parent=parent.strip())
+        candidate = TallyGroupMaster(name=name, parent=parent.strip())
+        # Real files duplicate group masters (e.g. every primary group twice,
+        # identical parent), and also emit masters for built-in primaries --
+        # reconcile identical/complementary copies, raise on a genuine
+        # conflict. See _reconcile_group and TallyGroupMaster's docstring.
+        groups[name] = _reconcile_group(name, groups[name], candidate) if name in groups else candidate
 
     return groups
+
+
+def _voucher_is_skippable(voucher_el: ET.Element) -> bool:
+    """A voucher flagged cancelled, deleted, or optional is not a posted book
+    entry, so it's excluded from the parsed dataset (found against real files
+    2026-08-08 -- optional vouchers appeared; cancelled/deleted are the same
+    category and skipped defensively). Checked BEFORE the >=2-legs / sum-to-
+    zero validation, since a cancelled voucher can legitimately be empty or
+    unbalanced -- validating it would reject the whole file over an entry that
+    doesn't affect the books at all."""
+    return (
+        (voucher_el.findtext("ISCANCELLED") or "").strip() == "Yes"
+        or (voucher_el.findtext("ISDELETED") or "").strip() == "Yes"
+        or (voucher_el.findtext("ISOPTIONAL") or "").strip() == "Yes"
+    )
 
 
 def _extract_vouchers(root: ET.Element, known_ledger_names: Optional[Set[str]]) -> List[TallyVoucher]:
@@ -567,12 +674,23 @@ def _extract_vouchers(root: ET.Element, known_ledger_names: Optional[Set[str]]) 
     vouchers: List[TallyVoucher] = []
 
     for voucher_el in root.iter("VOUCHER"):
+        if _voucher_is_skippable(voucher_el):
+            continue
+
         vn = voucher_el.findtext("VOUCHERNUMBER") or "(missing voucher number)"
         vch_type = voucher_el.get("VCHTYPE") or "(missing VCHTYPE)"
         date = _parse_tally_date(_required_text(voucher_el, "DATE", f"Voucher '{vn}'"), f"Voucher '{vn}' DATE")
         narration = voucher_el.findtext("NARRATION") or ""
 
-        entries = voucher_el.findall("ALLLEDGERENTRIES.LIST")
+        # Two valid ledger-entry containers (found against real files
+        # 2026-08-08): accounting-mode vouchers (Receipt/Payment/Contra/
+        # Journal) use ALLLEDGERENTRIES.LIST; invoice-mode vouchers
+        # (Purchase/Sales) use LEDGERENTRIES.LIST (with a parallel
+        # ALLINVENTORYENTRIES.LIST this parser doesn't need -- the ledger
+        # entries already sum to zero on their own). Read BOTH so either mode
+        # parses. findall is direct-child-only, so a nested allocation list's
+        # own *ENTRIES.LIST are never mistaken for top-level legs.
+        entries = voucher_el.findall("ALLLEDGERENTRIES.LIST") + voucher_el.findall("LEDGERENTRIES.LIST")
         if len(entries) < 2:
             raise TallyXmlParseError(f"Voucher '{vn}' has fewer than 2 ledger entries -- not a valid double-entry voucher.")
 
@@ -592,18 +710,16 @@ def _extract_vouchers(root: ET.Element, known_ledger_names: Optional[Set[str]]) 
             amount_raw = _required_text(entry, "AMOUNT", f"Voucher '{vn}' entry for '{ledger_name}'")
             amount = _parse_decimal(amount_raw, f"Voucher '{vn}' entry for '{ledger_name}' AMOUNT")
 
-            # See module docstring "Tally's sign convention" -- reject
-            # rather than silently trust one field over the other.
-            if is_debit and amount > 0:
-                raise TallyXmlParseError(
-                    f"Voucher '{vn}' entry for '{ledger_name}': ISDEEMEDPOSITIVE=Yes (debit) but AMOUNT is "
-                    f"positive ({amount}) -- expected a non-positive amount per Tally's sign convention."
-                )
-            if not is_debit and amount < 0:
-                raise TallyXmlParseError(
-                    f"Voucher '{vn}' entry for '{ledger_name}': ISDEEMEDPOSITIVE=No (credit) but AMOUNT is "
-                    f"negative ({amount}) -- expected a non-negative amount per Tally's sign convention."
-                )
+            # ISDEEMEDPOSITIVE and AMOUNT's sign USUALLY agree under Tally's
+            # convention (debit -> non-positive AMOUNT, credit -> non-negative),
+            # but real files legitimately disagree on adjustment legs -- a real
+            # "Rounding Off" entry marked ISDEEMEDPOSITIVE=No (credit) carried a
+            # NEGATIVE AMOUNT (-0.20) (found 2026-08-08). The signed AMOUNT is
+            # the authoritative value for all balance math (closing_balance uses
+            # -amount, never is_debit), and the per-voucher sum-to-zero check
+            # below is the real integrity guard, so a sign disagreement is NOT
+            # rejected -- we keep both fields exactly as stated. (Previously
+            # this raised and rejected the whole file over such an entry.)
 
             legs.append(TallyVoucherLeg(ledger_name=ledger_name, is_debit=is_debit, amount=amount))
 
@@ -686,25 +802,36 @@ def merge_tally_xml_fragments(fragments: List[TallyData]) -> TallyData:
     export, not an error -- it would only have been wrongly flagged if
     validated one fragment at a time (which is exactly why
     parse_tally_xml_fragment defers this check to here).
+
+    A ledger/group master appearing in MORE THAN ONE fragment is also normal,
+    not an error (found against real files 2026-08-08): a real transactions
+    file embeds its own copy of the masters, overlapping the dedicated masters
+    file -- often with one file stating an opening balance the other omits.
+    Duplicates are reconciled (identical/complementary copies merged, prefer
+    the populated PARENT and non-zero opening balance) rather than rejected;
+    only a genuine conflict raises. See _reconcile_ledger / _reconcile_group.
     """
     merged_ledgers: Dict[str, TallyLedgerMaster] = {}
     merged_groups: Dict[str, TallyGroupMaster] = {}
     merged_vouchers: List[TallyVoucher] = []
 
-    for fragment in fragments:
+    # Process the most masters-heavy fragment FIRST (stable sort) so, on a
+    # cross-file opening-balance/parent conflict, the dedicated masters file's
+    # value is the `existing` one _reconcile_* keeps -- that's the
+    # authoritative opening balance for opening_balance_vs_prior_year_closing.
+    # Cross-file reconciliation is non-strict: a snapshot difference between a
+    # masters file and a transactions file is legitimate, not corruption.
+    ordered = sorted(fragments, key=lambda f: len(f.ledgers), reverse=True)
+    for fragment in ordered:
         for name, master in fragment.ledgers.items():
-            if name in merged_ledgers:
-                raise TallyXmlParseError(
-                    f"Duplicate ledger master '{name}' across the uploaded files -- ambiguous which opening balance is authoritative."
-                )
-            merged_ledgers[name] = master
+            merged_ledgers[name] = (
+                _reconcile_ledger(name, merged_ledgers[name], master, strict=False) if name in merged_ledgers else master
+            )
 
         for name, group in fragment.groups.items():
-            if name in merged_groups:
-                raise TallyXmlParseError(
-                    f"Duplicate group master '{name}' across the uploaded files -- ambiguous which parent is authoritative."
-                )
-            merged_groups[name] = group
+            merged_groups[name] = (
+                _reconcile_group(name, merged_groups[name], group, strict=False) if name in merged_groups else group
+            )
 
         merged_vouchers.extend(fragment.vouchers)
 

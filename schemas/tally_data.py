@@ -32,15 +32,22 @@ class TallyLedgerMaster:
 
 @dataclass
 class TallyGroupMaster:
-    """A company-created CUSTOM group, e.g. "Overseas Debtors" nested under
-    the built-in "Sundry Debtors". Tally only emits a <GROUP> master for a
-    group a company actually created -- its own ~28 reserved primary groups
-    (Sundry Debtors, Capital Account, Sales Accounts, etc.) never get one,
-    since they're built in, not something a company defines. That's exactly
-    what lets TallyData.resolve_top_level_group (below) know when to stop
-    walking: once `parent` (or a ledger's own `parent`) names something that
-    isn't a key in `TallyData.groups`, it's reached a primary group (or a
-    group whose own PARENT was never supplied)."""
+    """A group master parsed from a <GROUP> element -- typically a
+    company-created CUSTOM group (e.g. "Overseas Debtors" nested under the
+    built-in "Sundry Debtors").
+
+    CORRECTION (2026-08-08, against real client files): the original
+    assumption here -- that Tally emits a <GROUP> master ONLY for
+    company-created groups, never for its own built-in primary groups -- is
+    FALSE for real exports. Real Tally files routinely emit <GROUP> masters
+    for the built-in primaries themselves ("Sundry Creditors" with PARENT
+    "Current Liabilities", "Sales Accounts"/"Current Liabilities"/etc. with an
+    EMPTY parent). So `TallyData.groups` can contain built-in primaries too,
+    and resolve_top_level_group can no longer assume "not a key in groups"
+    means "reached a primary". It now stops at the last non-empty group in the
+    chain instead (see below). It also tolerates the same NAME appearing twice
+    (real files duplicate group masters, with identical parent) -- dedup is
+    handled by the parser, not here."""
     name: str
     parent: str
 
@@ -80,26 +87,42 @@ class TallyData:
     groups: Dict[str, TallyGroupMaster] = field(default_factory=dict)
 
     def resolve_top_level_group(self, ledger_name: str, max_depth: int = 20) -> str:
-        """Walks this ledger's group ancestry upward through any custom
-        sub-groups (via `groups`) until it reaches a name that isn't itself a
-        custom group -- i.e. one of Tally's built-in reserved primary groups,
-        or a custom group whose own PARENT was never supplied. Without this,
-        a ledger filed under a custom sub-group (e.g. "Overseas Debtors"
-        under "Sundry Debtors") would be classified by its own immediate
-        PARENT string ("Overseas Debtors"), which will never match any of
-        Tally's fixed primary-group names.
+        """Walks this ledger's group ancestry upward through `groups` and
+        returns the top-level group name -- the last group in the chain whose
+        own PARENT is empty/absent (a primary group), or the last one before
+        the chain leaves `groups` entirely. Without this, a ledger filed under
+        a custom sub-group (e.g. "Overseas Debtors" under "Sundry Debtors")
+        would be classified by its own immediate PARENT string ("Overseas
+        Debtors"), which never matches any of Tally's fixed primary-group
+        names.
 
-        `max_depth` guards against a cyclical PARENT chain, which would mean
-        corrupt data (Tally itself doesn't allow creating one), not a real
-        export -- rather than looping forever, this just stops and returns
-        wherever the walk got to.
+        Two real-world cases this must handle (the second added 2026-08-08):
+        1. The built-in primary is NOT emitted as a group master (synthetic
+           data, and some real exports): the chain steps out of `groups` when
+           it names the primary; we return that name.
+        2. The built-in primary IS emitted as a group master (common in real
+           exports -- see TallyGroupMaster's corrected docstring), e.g.
+           "Food & Grocery Vendors" -> "Sundry Creditors" -> "Current
+           Liabilities", where "Current Liabilities" has an EMPTY parent. Here
+           we must STOP AT "Current Liabilities" and return it -- NOT step
+           into its empty parent "" and return "". Returning "" would break
+           P&L filtering (a "Sales Accounts"-parented ledger would resolve to
+           "" instead of "Sales Accounts" and wrongly survive the P&L
+           exclusion).
+
+        `max_depth` guards against a cyclical PARENT chain (corrupt data, not
+        a real export) -- it stops and returns wherever the walk got to.
         """
         current = self.ledgers[ledger_name].parent
         seen = {current}
         depth = 0
         while current in self.groups and depth < max_depth:
             nxt = self.groups[current].parent
-            if nxt in seen:
+            # Stop at `current` (the last real group) rather than stepping
+            # into an empty/absent parent or revisiting a seen node. This is
+            # what keeps a primary group emitted as a master (empty PARENT)
+            # from resolving to "" -- see case 2 above.
+            if not nxt or nxt in seen:
                 break
             current = nxt
             seen.add(current)
