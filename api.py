@@ -93,10 +93,16 @@ from pydantic import BaseModel, Field, model_validator
 from checks.opening_balance_vs_prior_year_closing import DEFAULT_TOLERANCE, run_check, run_check_from_db
 from checks.suspense_account_scrutiny import run_check as run_suspense_account_scrutiny
 from checks.suspense_account_scrutiny import run_check_from_db as run_suspense_check_from_db
-from db.queries import insert_tally_data, insert_trial_balance_ledgers
+from db.queries import (
+    delete_version_scoped_data,
+    get_tally_data,
+    get_trial_balance,
+    insert_tally_data,
+    insert_trial_balance_ledgers,
+)
 from parse_error_classification import classify_parse_error
 from schemas.enums import DocumentScope
-from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
+from schemas.tally_data import TallyData, TallyGroupMaster, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
 from tally_xml_parser import parse_tally_xml_data, parse_tally_xml_data_multi
 from trial_balance_csv_parser import parse_trial_balance_csv
@@ -324,15 +330,26 @@ class TallyVoucherIn(BaseModel):
     legs: List[TallyVoucherLegIn]
 
 
+class TallyGroupMasterIn(BaseModel):
+    name: str = Field(..., description="Group name, e.g. 'Overseas Debtors'")
+    parent: str = Field(..., description="Parent group name (may be empty for a primary group emitted as a master)")
+
+
 class TallyDataIn(BaseModel):
     """Accepts EITHER the original raw-payload shape (ledgers + vouchers,
     unchanged for backward compatibility -- exactly what /parse-tally-xml
     returns) OR a client_id/fy/version_id reference into Postgres -- never
     both, never neither. Same dual-mode pattern as RunChecksRequest above;
     see that class's docstring for the full rationale.
+
+    `groups` (added 2026-08-08) is optional even in payload mode -- it only
+    matters for persistence (/store-tally-data) and the visualizer's group
+    hierarchy walk, not for the checks run here, so an older caller that
+    omits it still validates and runs unchanged.
     """
     ledgers: Optional[List[TallyLedgerMasterIn]] = None
     vouchers: Optional[List[TallyVoucherIn]] = None
+    groups: Optional[List[TallyGroupMasterIn]] = None
     client_id: Optional[str] = None
     fy: Optional[str] = None
     version_id: Optional[str] = None
@@ -367,6 +384,7 @@ class TallyDataIn(BaseModel):
                 )
                 for v in self.vouchers
             ],
+            groups={g.name: TallyGroupMaster(name=g.name, parent=g.parent) for g in (self.groups or [])},
         )
 
 
@@ -408,21 +426,31 @@ class StoreTallyDataRequest(BaseModel):
     version_id: str
     ledgers: List[TallyLedgerMasterIn]
     vouchers: List[TallyVoucherIn]
+    # Optional/defaulted so a client that predates group persistence still
+    # stores ledgers + vouchers unchanged -- see tally_groups in db/schema.sql.
+    groups: List[TallyGroupMasterIn] = Field(default_factory=list)
 
 
 @app.post("/store-tally-data")
 def store_tally_data(request: StoreTallyDataRequest) -> dict:
-    """Upserts request.ledgers/vouchers into tally_ledgers/tally_vouchers/
-    tally_voucher_legs for (client_id, fy, version_id) -- safe to call again
-    for the same version (e.g. a "Replace File" correction).
+    """Upserts request.ledgers/vouchers/groups into tally_ledgers/
+    tally_vouchers/tally_voucher_legs/tally_groups for (client_id, fy,
+    version_id) -- safe to call again for the same version (e.g. a "Replace
+    File" correction).
     """
-    tally_data = TallyDataIn(ledgers=request.ledgers, vouchers=request.vouchers).to_domain()
+    tally_data = TallyDataIn(
+        ledgers=request.ledgers, vouchers=request.vouchers, groups=request.groups
+    ).to_domain()
     try:
         insert_tally_data(request.client_id, request.fy, request.version_id, tally_data)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Could not store Tally data in the database: {e}")
 
-    return {"stored_ledgers": len(tally_data.ledgers), "stored_vouchers": len(tally_data.vouchers)}
+    return {
+        "stored_ledgers": len(tally_data.ledgers),
+        "stored_vouchers": len(tally_data.vouchers),
+        "stored_groups": len(tally_data.groups),
+    }
 
 
 def _tally_data_to_response(tally_data: TallyData) -> dict:
@@ -502,3 +530,87 @@ async def parse_tally_xml_multi(files: List[UploadFile] = File(...)) -> dict:
         raise HTTPException(status_code=classified.status_code, detail=classified.to_dict())
 
     return _tally_data_to_response(tally_data)
+
+
+class VersionParsedDataRequest(BaseModel):
+    """Reference into the parsed data stored for one (client_id, fy,
+    version_id) -- the read counterpart to /store-tally-data and
+    /store-trial-balance. Added 2026-08-08 so the frontend's Tally Data
+    Visualizer can render a version's full parsed dataset by fetching it back
+    FROM Postgres, instead of the frontend embedding a ~1MB copy of it in
+    every Firestore version document (which broke uploads of large real
+    files -- the embedded copy alone exceeded Firestore's 1MB/doc limit). The
+    version doc now keeps only a lightweight summary; this endpoint serves the
+    real thing on demand.
+    """
+    client_id: str
+    fy: str
+    version_id: str
+
+
+@app.post("/version-parsed-data")
+def version_parsed_data(request: VersionParsedDataRequest) -> dict:
+    """Returns whichever parsed dataset(s) exist for this version, keyed by
+    kind so the frontend can build its ParsedFileData union directly:
+    - "tally_xml": the full {ledgers, vouchers, groups} shape (same as
+      /parse-tally-xml), or null if this version stored no Tally data.
+    - "trial_balance_csv": {ledgers: [...]} (same shape as
+      /parse-trial-balance), or null if this version stored no version-scoped
+      trial balance.
+    A version can have neither, one, or both. An empty (never-stored) version
+    returns both as null rather than an error -- the caller decides what that
+    means, matching the "no error, just empty" contract of the read layer.
+    """
+    try:
+        tally_data = get_tally_data(request.client_id, request.fy, request.version_id)
+        trial_balance = get_trial_balance(
+            request.client_id, request.fy, DocumentScope.VERSION_SCOPED, request.version_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not read parsed data from the database: {e}")
+
+    tally_present = bool(tally_data.ledgers) or bool(tally_data.vouchers)
+    tb_present = bool(trial_balance.ledgers)
+
+    return {
+        "tally_xml": _tally_data_to_response(tally_data) if tally_present else None,
+        "trial_balance_csv": (
+            {
+                "ledgers": [
+                    {"name": l.name, "group": l.group, "debit": str(l.debit), "credit": str(l.credit)}
+                    for l in trial_balance.ledgers
+                ]
+            }
+            if tb_present
+            else None
+        ),
+    }
+
+
+class DeleteVersionDataRequest(BaseModel):
+    """Reference to one version's worth of stored data to remove. Added
+    2026-08-08 as the compensating-cleanup path for the frontend's upload
+    ordering: parsed data is written to Postgres BEFORE files are uploaded to
+    Storage / the Firestore version doc is written (so a committed version
+    can never lack the queryable rows the visualizer + checks read). If a
+    later step in that same upload fails, the frontend calls this to roll the
+    Postgres rows back, so a failed upload leaves no orphaned data behind.
+    """
+    client_id: str
+    fy: str
+    version_id: str
+
+
+@app.post("/delete-version-data")
+def delete_version_data(request: DeleteVersionDataRequest) -> dict:
+    """Deletes every version-scoped row for (client_id, fy, version_id) across
+    all tables (see db.queries.delete_version_scoped_data). Idempotent -- a
+    version with nothing stored simply reports zero deletions rather than
+    erroring, so the frontend can call it unconditionally on a failed upload.
+    """
+    try:
+        deleted = delete_version_scoped_data(request.client_id, request.fy, request.version_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Could not delete version data from the database: {e}")
+
+    return {"deleted": deleted}

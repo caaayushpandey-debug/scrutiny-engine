@@ -124,10 +124,25 @@ CREATE TABLE IF NOT EXISTS tally_vouchers (
 CREATE INDEX IF NOT EXISTS idx_tally_vouchers_client_fy
     ON tally_vouchers (client_id, fy);
 
--- Matches how checks already key a voucher (suspense_account_scrutiny.py's
--- SourceReference.voucher_number, data-synthesizer's phantom_voucher_number).
-CREATE UNIQUE INDEX IF NOT EXISTS uq_tally_vouchers
-    ON tally_vouchers (client_id, fy, version_id, voucher_number);
+-- voucher_number is deliberately NOT unique within a version. Real Tally
+-- exports routinely reuse a voucher number across entries (and leave many
+-- blank) -- the anonymized real sample carries 4623 vouchers spanning only
+-- 2047 distinct numbers (one number appears 6 times; 81 have no number at
+-- all). An earlier UNIQUE(client_id, fy, version_id, voucher_number) index
+-- silently collapsed those ~2576 duplicate-numbered vouchers on insert,
+-- losing over half the file's real vouchers (and their legs). This is a plain
+-- (non-unique) index for lookup performance only; insert_tally_data replaces
+-- a version's vouchers wholesale (DELETE-then-INSERT, see db/queries.py)
+-- rather than upserting by number, so every voucher is preserved. Callers
+-- that reference a voucher by number (suspense_account_scrutiny.py's
+-- SourceReference) tolerate a repeated number the same way the source file
+-- does.
+-- Migration: drop the old UNIQUE index if a pre-2026-08-08 schema created it,
+-- so re-applying this file converges an existing database to the corrected
+-- (non-unique) shape rather than leaving the collapsing constraint in place.
+DROP INDEX IF EXISTS uq_tally_vouchers;
+CREATE INDEX IF NOT EXISTS idx_tally_vouchers_version
+    ON tally_vouchers (client_id, fy, version_id);
 
 ALTER TABLE tally_vouchers ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS client_isolation ON tally_vouchers;
@@ -169,3 +184,40 @@ CREATE POLICY client_isolation ON tally_voucher_legs
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON tally_voucher_legs TO scrutiny_app;
 GRANT USAGE, SELECT ON SEQUENCE tally_voucher_legs_id_seq TO scrutiny_app;
+
+-- ---------------------------------------------------------------------
+-- tally_groups -- schemas/tally_data.py's TallyGroupMaster (a <GROUP>
+-- master from a Tally XML export). Added 2026-08-08: originally TallyData's
+-- groups were only ever kept in the frontend's embedded Firestore copy and
+-- dropped at the Postgres store step. Once the frontend moved the visualizer
+-- to read the full parsed dataset back FROM Postgres (rather than embedding
+-- a ~1MB copy per version doc), groups had to be persisted here too, or the
+-- visualizer's Balance Sheet / P&L classification would lose the group
+-- hierarchy walk (resolve_top_level_group) for exports that emit <GROUP>
+-- masters -- real exports routinely do (the anonymized real files carry 44).
+-- Like tally_ledgers, TALLY_DATA is always VERSION_SCOPED, so version_id is
+-- NOT NULL and there is no scope column.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tally_groups (
+    id                  BIGSERIAL PRIMARY KEY,
+    client_id           TEXT NOT NULL,
+    fy                  TEXT NOT NULL,
+    version_id          TEXT NOT NULL,
+    group_name          TEXT NOT NULL,
+    parent              TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tally_groups_client_fy
+    ON tally_groups (client_id, fy);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_tally_groups
+    ON tally_groups (client_id, fy, version_id, group_name);
+
+ALTER TABLE tally_groups ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS client_isolation ON tally_groups;
+CREATE POLICY client_isolation ON tally_groups
+    USING (client_id = current_setting('app.current_client_id', true));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON tally_groups TO scrutiny_app;
+GRANT USAGE, SELECT ON SEQUENCE tally_groups_id_seq TO scrutiny_app;

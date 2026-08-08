@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 
 from db.connection import client_scoped_connection
 from schemas.enums import DocumentScope
-from schemas.tally_data import TallyData, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
+from schemas.tally_data import TallyData, TallyGroupMaster, TallyLedgerMaster, TallyVoucher, TallyVoucherLeg
 from schemas.trial_balance import LedgerBalance, TrialBalance
 
 # ---------------------------------------------------------------------
@@ -127,14 +127,33 @@ def get_tally_vouchers(client_id: str, fy: str, version_id: str) -> List[TallyVo
     ]
 
 
+def get_tally_groups(client_id: str, fy: str, version_id: str) -> Dict[str, TallyGroupMaster]:
+    """Loads every <GROUP> master for one (client, fy, version), keyed by
+    name -- matching TallyData.groups' own shape. Usually a handful of rows
+    (or none, for exports that never emit group masters).
+    """
+    with client_scoped_connection(client_id) as cur:
+        cur.execute(
+            "SELECT group_name, parent FROM tally_groups "
+            "WHERE client_id = %s AND fy = %s AND version_id = %s",
+            (client_id, fy, version_id),
+        )
+        rows = cur.fetchall()
+
+    return {name: TallyGroupMaster(name=name, parent=parent) for name, parent in rows}
+
+
 def get_tally_data(client_id: str, fy: str, version_id: str) -> TallyData:
-    """Composes get_tally_ledgers + get_tally_vouchers into the full
-    TallyData shape checks/suspense_account_scrutiny.py needs. Doesn't
-    issue SQL itself -- still only calls the two functions above.
+    """Composes get_tally_ledgers + get_tally_vouchers + get_tally_groups
+    into the full TallyData shape checks/suspense_account_scrutiny.py needs
+    (and the frontend's Tally Data Visualizer reads back via
+    /version-parsed-data). Doesn't issue SQL itself -- still only calls the
+    functions above.
     """
     return TallyData(
         ledgers=get_tally_ledgers(client_id, fy, version_id),
         vouchers=get_tally_vouchers(client_id, fy, version_id),
+        groups=get_tally_groups(client_id, fy, version_id),
     )
 
 
@@ -187,12 +206,17 @@ def insert_trial_balance_ledgers(
 
 
 def insert_tally_data(client_id: str, fy: str, version_id: str, tally_data: TallyData) -> None:
-    """Upserts every ledger master, voucher, and voucher leg in tally_data.
-    Legs have no natural unique key of their own (see CLAUDE.md), so a
-    voucher's legs are replaced wholesale (DELETE then re-INSERT) rather
-    than upserted row-by-row -- safe because this always runs inside one
-    client-scoped transaction (client_scoped_connection commits/rolls back
-    as a unit), so a re-run can never leave a voucher with a partial leg set.
+    """Replaces a version's Tally data wholesale (DELETE-then-INSERT), rather
+    than upserting row-by-row. Ledger + group masters ARE unique by name, so
+    those stay ON CONFLICT upserts; vouchers are the reason for the wholesale
+    replace: voucher_number is NOT unique within a real export (see
+    db/schema.sql -- the anonymized real sample has 4623 vouchers over only
+    2047 distinct numbers), so an upsert-by-number would silently collapse
+    every duplicate-numbered voucher and lose over half the file. Deleting a
+    version's vouchers first (legs cascade via the FK) and then plain-INSERTing
+    all of them preserves every voucher, and is still safe to re-run: it all
+    runs inside one client-scoped transaction (client_scoped_connection
+    commits/rolls back as a unit), so a re-run can never leave a partial set.
     """
     with client_scoped_connection(client_id) as cur:
         for ledger in tally_data.ledgers.values():
@@ -206,23 +230,36 @@ def insert_tally_data(client_id: str, fy: str, version_id: str, tally_data: Tall
                 (client_id, fy, version_id, ledger.name, ledger.parent, ledger.opening_balance),
             )
 
+        for group in tally_data.groups.values():
+            cur.execute(
+                """
+                INSERT INTO tally_groups (client_id, fy, version_id, group_name, parent)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (client_id, fy, version_id, group_name)
+                DO UPDATE SET parent = EXCLUDED.parent
+                """,
+                (client_id, fy, version_id, group.name, group.parent),
+            )
+
+        # Wholesale replace of this version's vouchers (legs cascade on the FK)
+        # -- see the docstring: voucher_number is not unique, so an upsert would
+        # collapse duplicates and lose vouchers.
+        cur.execute(
+            "DELETE FROM tally_vouchers WHERE client_id = %s AND fy = %s AND version_id = %s",
+            (client_id, fy, version_id),
+        )
         for voucher in tally_data.vouchers:
             cur.execute(
                 """
                 INSERT INTO tally_vouchers
                     (client_id, fy, version_id, voucher_number, vch_type, voucher_date, narration)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (client_id, fy, version_id, voucher_number)
-                DO UPDATE SET vch_type = EXCLUDED.vch_type,
-                               voucher_date = EXCLUDED.voucher_date,
-                               narration = EXCLUDED.narration
                 RETURNING id
                 """,
                 (client_id, fy, version_id, voucher.voucher_number, voucher.vch_type, voucher.date, voucher.narration),
             )
             (voucher_id,) = cur.fetchone()
 
-            cur.execute("DELETE FROM tally_voucher_legs WHERE voucher_id = %s", (voucher_id,))
             for leg_order, leg in enumerate(voucher.legs):
                 cur.execute(
                     """
@@ -232,3 +269,48 @@ def insert_tally_data(client_id: str, fy: str, version_id: str, tally_data: Tall
                     """,
                     (voucher_id, client_id, fy, version_id, leg.ledger_name, leg.is_debit, leg.amount, leg_order),
                 )
+
+
+def delete_version_scoped_data(client_id: str, fy: str, version_id: str) -> Dict[str, int]:
+    """Removes ALL version-scoped rows for one (client, fy, version) across
+    every table -- tally_ledgers/tally_groups/tally_vouchers (legs cascade
+    via the tally_voucher_legs FK's ON DELETE CASCADE) and the
+    version_scoped trial_balance_ledgers rows. Used as a compensating
+    cleanup: the frontend stores parsed data into Postgres BEFORE it uploads
+    files to Storage / writes the Firestore version doc (so a committed
+    version can never lack its queryable rows -- the visualizer and the
+    checks both read them from here now), and calls this to roll those rows
+    back if a later step in the same upload fails, so a failed upload never
+    leaves orphaned Postgres data behind. Returns per-table deleted counts.
+    Never touches period_scoped_prior_year trial-balance rows -- those aren't
+    version-scoped and don't belong to any single version's upload.
+    """
+    with client_scoped_connection(client_id) as cur:
+        cur.execute(
+            "DELETE FROM tally_vouchers WHERE client_id = %s AND fy = %s AND version_id = %s",
+            (client_id, fy, version_id),
+        )
+        deleted_vouchers = cur.rowcount
+        cur.execute(
+            "DELETE FROM tally_ledgers WHERE client_id = %s AND fy = %s AND version_id = %s",
+            (client_id, fy, version_id),
+        )
+        deleted_ledgers = cur.rowcount
+        cur.execute(
+            "DELETE FROM tally_groups WHERE client_id = %s AND fy = %s AND version_id = %s",
+            (client_id, fy, version_id),
+        )
+        deleted_groups = cur.rowcount
+        cur.execute(
+            "DELETE FROM trial_balance_ledgers "
+            "WHERE client_id = %s AND fy = %s AND version_id = %s AND scope = 'version_scoped'",
+            (client_id, fy, version_id),
+        )
+        deleted_trial_balance = cur.rowcount
+
+    return {
+        "tally_ledgers": deleted_ledgers,
+        "tally_groups": deleted_groups,
+        "tally_vouchers": deleted_vouchers,
+        "trial_balance_ledgers": deleted_trial_balance,
+    }
