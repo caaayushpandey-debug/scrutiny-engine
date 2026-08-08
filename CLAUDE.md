@@ -401,6 +401,50 @@ Postgres-sourced path produces byte-for-byte (well, paisa-for-paisa)
 identical results to the original file-sourced path, not just that it runs
 without crashing.
 
+### Version parsed-data read-back + group persistence (added 2026-08-08, `feature/large-file-upload-fix`)
+Backend support for the frontend's matching branch, which moves the full
+parsed Tally dataset OUT of the embedded Firestore version document (it
+exceeded Firestore's 1MB/doc limit for real ~150MB exports) and reads it back
+from Postgres — making Postgres the single authoritative store the frontend's
+Tally Data Visualizer renders from, not just what the checks read. Three
+backend changes:
+- **`tally_groups` table** (`db/schema.sql`) + persistence/read in
+  `db/queries.py`. Previously `<GROUP>` masters were parsed and returned by
+  `/parse-tally-xml` but DROPPED at the `/store-tally-data` step (`to_domain`
+  didn't set groups, and there was no table). Once the visualizer reads the
+  dataset back from Postgres, missing groups would regress its Balance Sheet /
+  P&L group-hierarchy walk (`TallyData.resolve_top_level_group`) — real exports
+  emit primary groups as masters, and a real ~156MB test file carries 28.
+  `insert_tally_data` now upserts groups; `get_tally_data` composes
+  ledgers + vouchers + **groups**; `/store-tally-data` (`StoreTallyDataRequest`,
+  `TallyDataIn`) accepts an optional `groups` list.
+- **`POST /version-parsed-data`** `{client_id, fy, version_id}` → returns the
+  version's full `{ledgers, vouchers, groups}` (same shape as `/parse-tally-xml`)
+  and/or its version-scoped `{ledgers}` trial balance, each `null` if not
+  stored. The read counterpart to `/store-*`, so the frontend visualizer can
+  fetch the full dataset on demand instead of embedding a copy.
+- **`POST /delete-version-data`** `{client_id, fy, version_id}` +
+  `db.queries.delete_version_scoped_data`: deletes every version-scoped row
+  (tally ledgers/groups/vouchers+legs and version_scoped trial-balance rows;
+  leaves `period_scoped_prior_year` untouched). Idempotent. The frontend calls
+  it as compensating cleanup when an upload fails AFTER its Postgres store but
+  before the Storage/Firestore commit, so a failed upload never orphans rows.
+- **Voucher data-loss fix**: `voucher_number` is NOT unique within a real
+  export (the anonymized real sample has 4623 vouchers over only 2047 distinct
+  numbers; 81 blank). The old `UNIQUE(client_id, fy, version_id, voucher_number)`
+  index silently collapsed ~2576 duplicate-numbered vouchers on insert (and
+  their legs) — the suspense check reading from Postgres would have examined
+  2047 instead of 4623. Replaced with a plain (non-unique) index;
+  `insert_tally_data` now replaces a version's vouchers **wholesale**
+  (DELETE-then-INSERT, legs cascade) instead of upserting by number, so every
+  voucher is preserved. Ledger/group masters ARE unique by name and stay
+  upserts. `db/schema.sql` drops the old unique index on re-apply.
+- Verified: `tests/verify_version_parsed_data_roundtrip.py` (groups round-trip
+  + version-scoped delete leaves prior-year rows intact), the full 140-test
+  unit suite, and both `verify_*_via_db.py` check regressions (5 companies
+  each) all pass; plus live end-to-end from the frontend against a real 156MB
+  export (see that repo's CLAUDE.md "Large-file upload fixes").
+
 ## Structure (update as it grows)
 - `schemas/` — one module per document type, each independently importable.
   `schemas/trial_balance.py` (`LedgerBalance`, `TrialBalance`) and
